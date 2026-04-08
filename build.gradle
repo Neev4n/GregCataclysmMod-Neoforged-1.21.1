@@ -135,6 +135,7 @@ dependencies {
     // The group id is ignored when searching -- in this case, it is "blank"
     // implementation "blank:coolmod-${mc_version}:${coolmod_version}"
     implementation "curse.maven:lendercataclysm-551586:7845980"
+    implementation "curse.maven:lionfish-api-1001614:6168249"
     // Example mod dependency using a file as dependency
     // implementation files("libs/coolmod-${mc_version}-${coolmod_version}.jar")
 
