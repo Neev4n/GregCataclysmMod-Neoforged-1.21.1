@@ -29,7 +29,11 @@ import net.minecraft.world.level.gameevent.GameEvent;
 import com.github.L_Ender.cataclysm.entity.AnimationMonster.BossMonsters.LLibrary_Boss_Monster;
 import com.github.L_Ender.cataclysm.entity.InternalAnimationMonster.IABossMonsters.IABoss_monster;
 import com.github.L_Ender.cataclysm.entity.projectile.Flare_Bomb_Entity;
+import com.github.L_Ender.cataclysm.entity.projectile.Laser_Beam_Entity;
 import com.github.L_Ender.cataclysm.entity.projectile.Lava_Bomb_Entity;
+import com.github.L_Ender.cataclysm.entity.projectile.Wither_Homing_Missile_Entity;
+import com.github.L_Ender.cataclysm.entity.projectile.Wither_Missile_Entity;
+import com.github.L_Ender.cataclysm.init.ModEntities;
 import net.minecraft.world.entity.ai.goal.AvoidEntityGoal;
 import net.minecraft.world.entity.ai.goal.target.NearestAttackableTargetGoal;
 import net.minecraft.world.entity.animal.Chicken;
@@ -39,9 +43,12 @@ import net.minecraft.world.entity.monster.RangedAttackMob;
 import net.minecraft.world.entity.projectile.AbstractArrow;
 import net.minecraft.world.entity.projectile.ProjectileUtil;
 import net.minecraft.world.entity.projectile.WitherSkull;
+import net.minecraft.world.entity.projectile.windcharge.WindCharge;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.Vec3;
 import org.slf4j.Logger;
 import javax.annotation.Nullable;
@@ -67,7 +74,18 @@ public class GregEntity extends Chicken implements RangedAttackMob{
     private static final float ATTACK_RADIUS = 20.0F;
     private static final int ATTACK_INTERVAL = 1; // ticks between shots
     /** Ticks between threat-triggered dodges; prevents spamming one dodge per tick. */
-    private static final int THREAT_DODGE_COOLDOWN = 40;
+    private static final int THREAT_DODGE_COOLDOWN = 10;
+
+    /**
+     * Combat states that alter Greg's ranged attack behaviour.
+     * Add new entries here to introduce further timed overrides.
+     */
+    private enum CombatState {
+        /** Default: fires lava bombs at long range, sonic boom up close. */
+        NORMAL,
+        /** Fires wind charges for {@code combatStateTimer} ticks after a ROCKETPUNCH alert. */
+        WIND_CHARGE
+    }
 
     /** Counts down to the next shot; -1 means uninitialised. */
     private int attackTime = -1;
@@ -75,6 +93,16 @@ public class GregEntity extends Chicken implements RangedAttackMob{
     private int threatDodgeCooldown = 0;
     /** Suppresses wither skull firing for 20 ticks after a dodge to avoid self-damage. */
     private int dodgeShootLockout = 0;
+
+    /** Current combat state; determines which attack is fired each cycle. */
+    private CombatState combatState = CombatState.NORMAL;
+    /** Remaining ticks in the current non-NORMAL state; 0 means revert to NORMAL next tick. */
+    private int combatStateTimer = 0;
+
+    /** Block positions of the currently active wall, in placement order. Empty when no wall is up. */
+    private final List<BlockPos> activeWallBlocks = new ArrayList<>();
+    /** Ticks remaining before the active wall is torn down; 0 means no wall is active. */
+    private int wallBreakTimer = 0;
 
     /** Constructs Greg and logs which dimension and side (client/server) he was created on. */
     public GregEntity(EntityType<? extends Chicken> entityType, Level level) {
@@ -117,9 +145,9 @@ public class GregEntity extends Chicken implements RangedAttackMob{
      */
     @Override
     protected void registerGoals() {
-        super.registerGoals();
+        //super.registerGoals();
         this.goalSelector.addGoal(0, new FloatGoal(this));
-        this.goalSelector.addGoal(3, new AvoidEntityGoal<>(this, IABoss_monster.class, 20.0F, 1.0, 1.0));
+        //this.goalSelector.addGoal(3, new AvoidEntityGoal<>(this, IABoss_monster.class, 20.0F, 1.0, 1.0));
         this.targetSelector.addGoal(1, new NearestAttackableTargetGoal<>(this, LLibrary_Boss_Monster.class, false));
         this.targetSelector.addGoal(1, new NearestAttackableTargetGoal<>(this, IABoss_monster.class, false));
         LOGGER.info("[Greg] Registered goals");
@@ -129,11 +157,36 @@ public class GregEntity extends Chicken implements RangedAttackMob{
     public void tick() {
         super.tick();
         if (!this.level().isClientSide()) {
+            tickCombatState();
+            tickWall();
             tickRangedAttack();
             tickBossAlert();
             tickThreatDetection();
             tickPotionDrinking();
         }
+    }
+
+    /**
+     * Counts down the combat state timer each tick and reverts to NORMAL when it expires.
+     * Runs before tickRangedAttack so the correct state is always used for the current tick.
+     */
+    private void tickCombatState() {
+        if (combatState == CombatState.NORMAL) return;
+        if (--combatStateTimer <= 0) {
+            LOGGER.info("[Greg] Combat state {} expired, reverting to NORMAL", combatState);
+            combatState = CombatState.NORMAL;
+            combatStateTimer = 0;
+        }
+    }
+
+    /**
+     * Transitions Greg into the given combat state for {@code durationTicks} ticks.
+     * If the same state is already active, the timer is refreshed rather than stacked.
+     */
+    private void setCombatState(CombatState state, int durationTicks) {
+        LOGGER.info("[Greg] Combat state {} -> {} for {} ticks", combatState, state, durationTicks);
+        combatState = state;
+        combatStateTimer = durationTicks;
     }
 
     /**
@@ -195,8 +248,12 @@ public class GregEntity extends Chicken implements RangedAttackMob{
         serverLevel.getServer().getPlayerList().broadcastSystemMessage(
                 Component.literal("[Greg] Boss alert: " + alert), false);
 
-        if (alert.equals("FLARE_SHOT") || alert.equals("OVERPOWER") || alert.equals("FIRE")){
-            return;
+        if (alert.equals("HARBINGER_CHARGE")) {
+            //setCombatState(CombatState.WIND_CHARGE, 40);
+            LivingEntity target = this.getTarget();
+            if (target != null) {
+                buildWallBox(target, 5);
+            }
         }
         performDodge(serverLevel, data);
     }
@@ -214,6 +271,9 @@ public class GregEntity extends Chicken implements RangedAttackMob{
         List<Entity> threats = getThreatList();
         if (threats.isEmpty()) return;
 
+        for (Entity threat : threats){
+            buildWallBox(threat, 1);
+        }
         LOGGER.info("[Greg] {} threat(s) detected nearby, triggering dodge", threats.size());
         ServerLevel serverLevel = (ServerLevel) this.level();
         GregSavedData data = GregSavedData.get(serverLevel.getServer());
@@ -264,44 +324,52 @@ public class GregEntity extends Chicken implements RangedAttackMob{
     /**
      * Picks a dodge target index from the list, excluding the current index.
      * If index is -1 (unset), picks the closest point to Greg's current position.
+     * Otherwise scores each candidate as dist²(point, boss) + dist²(point, greg),
+     * choosing the point that is collectively farthest from both — no sqrt needed.
      */
     private int pickDodgeTarget(List<BlockPos> dodgePoints, int currentIndex) {
-        if (currentIndex == -1) {
-            // Pick closest point
-            int closest = 0;
-            double closestDist = Double.MAX_VALUE;
-            for (int i = 0; i < dodgePoints.size(); i++) {
-                double dist = this.blockPosition().distSqr(dodgePoints.get(i));
-                if (dist < closestDist) {
-                    closestDist = dist;
-                    closest = i;
-                }
-            }
-            return closest;
-        }
-
+        // Pick closest point on first dodge (Greg hasn't moved yet)
         if (this.getTarget() == null){
-            return dodgePoints.size() - 1;
+            return 0;
         }
-
-        BlockPos targetPos = this.getTarget().getOnPos();
-        int furthestInd = -1;
+        int furtherst = 0;
         double furthestDist = 0;
-
-        for (int i = 0; i < dodgePoints.size(); i++){
-
+        for (int i = 0; i < dodgePoints.size(); i++) {
             if (i == currentIndex){
                 continue;
             }
-
-            double dist = targetPos.distSqr(dodgePoints.get(i));
+            double dist = this.getTarget().blockPosition().distSqr(dodgePoints.get(i));
             if (dist > furthestDist) {
                 furthestDist = dist;
-                furthestInd = i;
+                furtherst = i;
             }
         }
+        return furtherst;
 
-        return furthestInd;
+        //return (currentIndex + 1) % dodgePoints.size();
+
+//        if (this.getTarget() == null) {
+//            return dodgePoints.size() - 1;
+//        }
+//
+//        BlockPos bossPos = this.getTarget().getOnPos();
+//        BlockPos gregPos = this.blockPosition();
+//        int bestInd = -1;
+//        double bestScore = -1;
+//
+//        for (int i = 0; i < dodgePoints.size(); i++) {
+//            if (i == currentIndex) continue;
+//
+//            BlockPos candidate = dodgePoints.get(i);
+//            // Sum of squared distances from both the boss and Greg — maximise to stay far from both
+//            double score = bossPos.distSqr(candidate) + gregPos.distSqr(candidate);
+//            if (score > bestScore) {
+//                bestScore = score;
+//                bestInd = i;
+//            }
+//        }
+//
+//        return bestInd;
     }
 
     /**
@@ -330,15 +398,19 @@ public class GregEntity extends Chicken implements RangedAttackMob{
      * Fires unconditionally once the countdown reaches zero — no line of sight required.
      */
     private void tickRangedAttack() {
-        if (dodgeShootLockout > 0) {
-            dodgeShootLockout--;
-            return;
-        }
+//        if (dodgeShootLockout > 0) {
+//            dodgeShootLockout--;
+//            return;
+//        }
 
         LivingEntity target = this.getTarget();
         if (target == null) {
             // Reset state when Greg has no target
             attackTime = -1;
+            return;
+        }
+
+        if (!this.hasLineOfSight(target)){
             return;
         }
 
@@ -354,17 +426,16 @@ public class GregEntity extends Chicken implements RangedAttackMob{
         }
     }
 
-    /** Delegates to fireWitherSkullAt so the interface contract is satisfied. */
+    /** Dispatches the ranged attack based on the current combat state. */
     @Override
     public void performRangedAttack(LivingEntity target, float distanceFactor) {
-        if (this.distanceTo(target) <= 20.0F) {
-            fireSonicBoomAt(target);
-            LOGGER.info("[Greg] Target too close to shoot (distance={}), skipping", this.distanceTo(target));
-
-        } else{
-            fireWitherSkullAt(target);
+        if (!this.hasLineOfSight(target)){
+            return;
         }
-
+        switch (combatState) {
+            case WIND_CHARGE -> fireWindChargeAt(target);
+            case NORMAL      -> fireSonicBoomAt(target);
+        }
     }
 
     /**
@@ -429,6 +500,7 @@ public class GregEntity extends Chicken implements RangedAttackMob{
 
         // Spawn 1 block ahead of Greg in the direction of the target
         WitherSkull skull = new WitherSkull(this.level(), this, direction);
+
         skull.setOwner(this);
         skull.setPosRaw(eyeX + direction.x, eyeY + direction.y, eyeZ + direction.z);
         this.level().addFreshEntity(skull);
@@ -441,14 +513,226 @@ public class GregEntity extends Chicken implements RangedAttackMob{
     }
 
     /**
-     * Returns all Netherite Monstrosity projectiles within 20 blocks of Greg.
-     * Currently tracks: Flare_Bomb_Entity (flareshoot) and Lava_Bomb_Entity (magmashoot).
+     * Fires a Flare_Bomb_Entity from Greg's eye position toward the given entity.
+     * Aims at the lower third of the target's bounding box with a slight upward arc
+     * (+ 0.2 * horizontal distance) matching the Netherite Monstrosity's own shoot logic.
+     * Skips if the target is within 3 blocks.
+     */
+    private void fireFlareBombAt(Entity target) {
+        if (this.distanceTo(target) <= 3.0F) {
+            LOGGER.info("[Greg] Target too close to shoot flare bomb (distance={}), skipping", this.distanceTo(target));
+            return;
+        }
+
+        double eyeX = this.getX();
+        double eyeY = this.getEyeY();
+        double eyeZ = this.getZ();
+
+        // Aim at the lower third of the target's bounding box
+        double aimY = target.getBoundingBox().minY + target.getBbHeight() / 3.0;
+        double dx = target.getX() - eyeX;
+        double dy = aimY - eyeY;
+        double dz = target.getZ() - eyeZ;
+        // Arc factor mirrors the Monstrosity: adds +0.2 blocks of lift per block of horizontal distance
+        double horizontalDist = Math.sqrt(dx * dx + dz * dz);
+
+        Flare_Bomb_Entity flare = new Flare_Bomb_Entity(
+                ModEntities.FLARE_BOMB.get(),
+                this.level(),
+                this
+        );
+        flare.setPosRaw(eyeX, eyeY, eyeZ);
+        flare.shoot(dx, dy + 0.2 * horizontalDist, dz, 1.0F, 1.0F);
+        this.level().addFreshEntity(flare);
+
+        LOGGER.info("[Greg] Fired FlareBomb at entity={} pos={}", target.getType().toShortString(), this.blockPosition());
+    }
+
+    /**
+     * Fires a Lava_Bomb_Entity from Greg's eye position toward the given entity.
+     * On hit, the bomb creates a power-2 explosion (no block destruction).
+     * Uses the same arc and aim logic as fireFlareBombAt.
+     * Skips if the target is within 3 blocks.
+     */
+    private void fireLavaBombAt(Entity target) {
+        if (this.distanceTo(target) <= 3.0F) {
+            LOGGER.info("[Greg] Target too close to shoot lava bomb (distance={}), skipping", this.distanceTo(target));
+            return;
+        }
+
+        double eyeX = this.getX();
+        double eyeY = this.getEyeY();
+        double eyeZ = this.getZ();
+
+        double aimY = target.getBoundingBox().minY + target.getBbHeight() / 3.0;
+        double dx = target.getX() - eyeX;
+        double dy = aimY - eyeY;
+        double dz = target.getZ() - eyeZ;
+        double horizontalDist = Math.sqrt(dx * dx + dz * dz);
+
+        Lava_Bomb_Entity lava = new Lava_Bomb_Entity(
+                ModEntities.LAVA_BOMB.get(),
+                this.level(),
+                this
+        );
+        lava.setPosRaw(eyeX, eyeY, eyeZ);
+        lava.shoot(dx, dy + 0.2 * horizontalDist, dz, 1.0F, 1.0F);
+        this.level().addFreshEntity(lava);
+
+        LOGGER.info("[Greg] Fired LavaBomb at entity={} pos={}", target.getType().toShortString(), this.blockPosition());
+    }
+
+    /**
+     * Builds a hollow 5×5 obsidian box centred on the target's block position,
+     * 5 blocks tall, with no floor (boss stands on existing ground) and no ceiling.
+     * Only air blocks are replaced; existing blocks are never overwritten.
+     * Placed positions are recorded in {@code activeWallBlocks} and torn down after 80 ticks
+     * by the shared {@code tickWall} mechanism.
+     */
+    public void buildWallBox(Entity target, int radius) {
+        ServerLevel serverLevel = (ServerLevel) this.level();
+
+        int centerX = target.getBlockX();
+        int baseY   = Mth.floor(target.getY());
+        int centerZ = target.getBlockZ();
+
+        BlockState wallBlock = Blocks.OBSIDIAN.defaultBlockState();
+        int placed = 0;
+
+        // Iterate a 5×5 footprint (-2 to +2 in X and Z); only place on the perimeter
+        for (int wx = -radius; wx <= radius; wx++) {
+            for (int wz = -radius; wz <= radius; wz++) {
+                if (wx != -radius && wx != radius && wz != -radius && wz != radius) continue; // skip interior
+                for (int h = -radius; h < radius; h++) {
+                    BlockPos pos = new BlockPos(centerX + wx, baseY + h, centerZ + wz);
+                    if (serverLevel.getBlockState(pos).isAir()) {
+                        serverLevel.setBlock(pos, wallBlock, 3);
+                        activeWallBlocks.add(pos);
+                        placed++;
+                    }
+                }
+            }
+        }
+
+        wallBreakTimer = 80;
+        LOGGER.info("[Greg] Built box around boss at {}: {} blocks placed, tears down in 80 ticks",
+                target.blockPosition(), placed);
+    }
+
+    /**
+     * Builds a 10-wide × 5-tall obsidian wall perpendicular to the Greg-to-target direction,
+     * placed with its base at Greg's feet and its centre 3 blocks in front of Greg.
+     * Only air blocks are replaced; existing blocks are never overwritten.
+     * All placed positions are recorded in {@code activeWallBlocks} and torn down after 40 ticks.
+     * Calling this while a wall is already active resets the timer and extends the existing wall.
+     */
+    public void buildWall(Entity target) {
+        ServerLevel serverLevel = (ServerLevel) this.level();
+
+        // Horizontal direction from Greg toward the target (Y ignored so the wall stays vertical)
+        double dx = target.getX() - this.getX();
+        double dz = target.getZ() - this.getZ();
+        Vec3 dir = new Vec3(dx, 0, dz).normalize();
+
+        // Wall centre: 3 blocks ahead of Greg in the direction of the target
+        double centerX = this.getX() + dir.x * 10;
+        double centerZ = this.getZ() + dir.z * 10;
+        int baseY = Mth.floor(this.getY());
+
+        // Perpendicular direction in the horizontal plane (rotate dir 90° around Y)
+        Vec3 perp = new Vec3(-dir.z, 0, dir.x);
+
+        BlockState wallBlock = Blocks.OBSIDIAN.defaultBlockState();
+        int placed = 0;
+
+        // 10 columns centred on the midpoint (-5 to +4), 5 rows from baseY upward
+        for (int w = -5; w < 5; w++) {
+            for (int h = -5; h < 5; h++) {
+                BlockPos pos = BlockPos.containing(
+                        centerX + perp.x * w,
+                        baseY + h,
+                        centerZ + perp.z * w
+                );
+                // Only place in air — never overwrite existing blocks
+                if (serverLevel.getBlockState(pos).isAir()) {
+                    serverLevel.setBlock(pos, wallBlock, 3);
+                    activeWallBlocks.add(pos);
+                    placed++;
+                }
+            }
+        }
+
+        wallBreakTimer = 80;
+        LOGGER.info("[Greg] Built wall: {} blocks placed, tears down in 40 ticks", placed);
+    }
+
+    /**
+     * Counts down the wall break timer and removes all recorded wall blocks when it expires.
+     * Only removes blocks that are still obsidian — skips any that were already broken externally.
+     */
+    private void tickWall() {
+        if (activeWallBlocks.isEmpty()) return;
+        if (--wallBreakTimer > 0) return;
+
+        ServerLevel serverLevel = (ServerLevel) this.level();
+        int broken = 0;
+        for (BlockPos pos : activeWallBlocks) {
+            if (serverLevel.getBlockState(pos).is(Blocks.OBSIDIAN)) {
+                serverLevel.setBlock(pos, Blocks.AIR.defaultBlockState(), 3);
+                broken++;
+            }
+        }
+        activeWallBlocks.clear();
+        LOGGER.info("[Greg] Wall torn down: {} blocks removed", broken);
+    }
+
+    /**
+     * Fires a WindCharge from Greg's eye position toward the given entity.
+     * Uses the player WindCharge (not BreezeWindCharge, which is Breeze-specific).
+     * Spawned at eye level and aimed at the centre of the target's bounding box.
+     * The Breeze shoots at velocity 0.7F; we match that here.
+     * Skips if the target is within 3 blocks.
+     */
+    private void fireWindChargeAt(Entity target) {
+        if (this.distanceTo(target) <= 3.0F) {
+            LOGGER.info("[Greg] Target too close to shoot wind charge (distance={}), skipping", this.distanceTo(target));
+            return;
+        }
+
+        double eyeX = this.getX();
+        double eyeY = this.getEyeY();
+        double eyeZ = this.getZ();
+
+        Vec3 direction = new Vec3(
+                target.getX() - eyeX,
+                target.getBoundingBox().getCenter().y - eyeY,
+                target.getZ() - eyeZ
+        ).normalize();
+
+        // WindCharge(Level, x, y, z, direction) positions the charge and sets its trajectory
+        WindCharge charge = new WindCharge(this.level(), eyeX, eyeY, eyeZ, direction);
+        this.level().addFreshEntity(charge);
+
+        LOGGER.info("[Greg] Fired WindCharge at entity={} pos={}", target.getType().toShortString(), this.blockPosition());
+    }
+
+    /**
+     * Returns all tracked boss projectiles within 5 blocks of Greg.
+     * Netherite Monstrosity: Flare_Bomb_Entity, Lava_Bomb_Entity.
+     * Harbinger: Laser_Beam_Entity, Wither_Missile_Entity, Wither_Homing_Missile_Entity.
      */
     public List<Entity> getThreatList() {
         List<Entity> threats = new ArrayList<>();
         var aabb = this.getBoundingBox().inflate(5);
+
+        // Netherite Monstrosity projectiles
         threats.addAll(this.level().getEntitiesOfClass(Flare_Bomb_Entity.class, aabb));
         threats.addAll(this.level().getEntitiesOfClass(Lava_Bomb_Entity.class, aabb));
+
+        // Harbinger projectiles
+        threats.addAll(this.level().getEntitiesOfClass(Laser_Beam_Entity.class, aabb));
+        threats.addAll(this.level().getEntitiesOfClass(Wither_Missile_Entity.class, aabb));
+        threats.addAll(this.level().getEntitiesOfClass(Wither_Homing_Missile_Entity.class, aabb));
 
         for (Entity threat : threats) {
             LOGGER.info("[Greg] Threat: type={} pos={}", threat.getType().toShortString(), threat.blockPosition());
@@ -473,7 +757,7 @@ public class GregEntity extends Chicken implements RangedAttackMob{
      */
     @Override
     public boolean handleLeashAtDistance(Entity leashHolder, float distance) {
-        if (distance > 7.0F) {
+        if (distance > 5.0F) {
             this.elasticRangeLeashBehaviour(leashHolder, distance);
         }
         return true;
