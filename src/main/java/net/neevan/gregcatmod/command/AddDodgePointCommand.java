@@ -6,6 +6,8 @@ import net.minecraft.commands.Commands;
 import net.minecraft.core.BlockPos;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.HitResult;
 import net.neevan.gregcatmod.data.GregSavedData;
 
 public class AddDodgePointCommand {
@@ -19,10 +21,15 @@ public class AddDodgePointCommand {
         );
     }
 
-    /** Adds the player's current block position as a new dodge point. */
+    /** Adds the block the player is looking at as a new dodge point (max 20 block reach). */
     private static int execute(CommandSourceStack source) throws com.mojang.brigadier.exceptions.CommandSyntaxException {
         ServerPlayer player = source.getPlayerOrException();
-        BlockPos pos = player.blockPosition();
+        HitResult hit = player.pick(20.0, 1.0F, false);
+        if (hit.getType() != HitResult.Type.BLOCK) {
+            source.sendFailure(Component.literal("Not looking at a block (max range 20 blocks)"));
+            return 0;
+        }
+        BlockPos pos = ((BlockHitResult) hit).getBlockPos();
         GregSavedData data = GregSavedData.get(source.getServer());
 
         data.addDodgePoint(pos);
