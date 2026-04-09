@@ -3,6 +3,8 @@ package net.neevan.gregcatmod;
 import com.mojang.logging.LogUtils;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.effect.MobEffectInstance;
+import net.minecraft.world.effect.MobEffects;
 import net.minecraft.world.entity.Entity;
 import net.neevan.gregcatmod.data.GregSavedData;
 import net.neevan.gregcatmod.entity.ModEntities;
@@ -67,7 +69,7 @@ public class GregCataclysmMod {
         if (entity instanceof GregEntity greg){
             greg.setCustomName(Component.literal("Greg"));
             LOGGER.info("[Greg] Named 'Greg' on join at pos={}", greg.blockPosition());
-
+            greg.addEffect(new MobEffectInstance(MobEffects.GLOWING, Integer.MAX_VALUE));
             // Update saved data on the server side only to avoid duplicate writes
             if (!event.getLevel().isClientSide()) {
                 GregSavedData.get(((ServerLevel) event.getLevel()).getServer())
