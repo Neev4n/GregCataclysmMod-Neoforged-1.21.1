@@ -5,7 +5,8 @@
   "mixins": [
     "LLibraryBossMonsterMixin",
     "IABossMonsterMixin",
-    "NetheriteMonstrosityMixin"
+    "NetheriteMonstrosityMixin",
+    "EnderGuardianMixin"
   ],
   "client": [
 
