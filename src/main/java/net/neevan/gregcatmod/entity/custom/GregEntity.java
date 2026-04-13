@@ -1,6 +1,10 @@
 package net.neevan.gregcatmod.entity.custom;
 
 
+import com.github.L_Ender.cataclysm.entity.AnimationMonster.BossMonsters.Ignis_Entity;
+import com.github.L_Ender.cataclysm.entity.AnimationMonster.BossMonsters.The_Leviathan.*;
+import com.github.L_Ender.cataclysm.entity.effect.Flame_Strike_Entity;
+import com.github.L_Ender.cataclysm.entity.projectile.*;
 import com.mojang.logging.LogUtils;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.world.damagesource.DamageSource;
@@ -21,6 +25,7 @@ import net.minecraft.network.syncher.SynchedEntityData;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.sounds.SoundEvents;
 import net.minecraft.world.entity.ai.goal.FloatGoal;
+import net.minecraft.world.entity.ai.goal.MeleeAttackGoal;
 import net.neevan.gregcatmod.data.GregSavedData;
 import net.minecraft.util.Mth;
 import net.minecraft.world.item.alchemy.PotionContents;
@@ -28,11 +33,6 @@ import net.minecraft.world.item.alchemy.Potions;
 import net.minecraft.world.level.gameevent.GameEvent;
 import com.github.L_Ender.cataclysm.entity.AnimationMonster.BossMonsters.LLibrary_Boss_Monster;
 import com.github.L_Ender.cataclysm.entity.InternalAnimationMonster.IABossMonsters.IABoss_monster;
-import com.github.L_Ender.cataclysm.entity.projectile.Flare_Bomb_Entity;
-import com.github.L_Ender.cataclysm.entity.projectile.Laser_Beam_Entity;
-import com.github.L_Ender.cataclysm.entity.projectile.Lava_Bomb_Entity;
-import com.github.L_Ender.cataclysm.entity.projectile.Wither_Homing_Missile_Entity;
-import com.github.L_Ender.cataclysm.entity.projectile.Wither_Missile_Entity;
 import com.github.L_Ender.cataclysm.init.ModEntities;
 import net.minecraft.world.entity.ai.goal.AvoidEntityGoal;
 import net.minecraft.world.entity.ai.goal.target.NearestAttackableTargetGoal;
@@ -49,11 +49,17 @@ import net.minecraft.world.item.Items;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.ClipContext;
+import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 import org.slf4j.Logger;
 import javax.annotation.Nullable;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Greg — a custom chicken entity with reduced health (4 HP) and standard movement speed.
@@ -74,7 +80,7 @@ public class GregEntity extends Chicken implements RangedAttackMob{
     private static final float ATTACK_RADIUS = 20.0F;
     private static final int ATTACK_INTERVAL = 1; // ticks between shots
     /** Ticks between threat-triggered dodges; prevents spamming one dodge per tick. */
-    private static final int THREAT_DODGE_COOLDOWN = 10;
+    private static final int THREAT_DODGE_COOLDOWN = 20;
 
     /**
      * Combat states that alter Greg's ranged attack behaviour.
@@ -93,16 +99,16 @@ public class GregEntity extends Chicken implements RangedAttackMob{
     private int threatDodgeCooldown = 0;
     /** Suppresses wither skull firing for 20 ticks after a dodge to avoid self-damage. */
     private int dodgeShootLockout = 0;
+    /** Cooldown between boss-retarget dodge arrows; prevents firing every tick. */
+    private int retargetDodgeCooldown = 0;
 
     /** Current combat state; determines which attack is fired each cycle. */
     private CombatState combatState = CombatState.NORMAL;
     /** Remaining ticks in the current non-NORMAL state; 0 means revert to NORMAL next tick. */
     private int combatStateTimer = 0;
 
-    /** Block positions of the currently active wall, in placement order. Empty when no wall is up. */
-    private final List<BlockPos> activeWallBlocks = new ArrayList<>();
-    /** Ticks remaining before the active wall is torn down; 0 means no wall is active. */
-    private int wallBreakTimer = 0;
+    /** Maps each active wall block position to its remaining ticks before removal. */
+    private final Map<BlockPos, Integer> activeWallBlocks = new HashMap<>();
 
     /** Constructs Greg and logs which dimension and side (client/server) he was created on. */
     public GregEntity(EntityType<? extends Chicken> entityType, Level level) {
@@ -119,7 +125,8 @@ public class GregEntity extends Chicken implements RangedAttackMob{
         return Mob.createMobAttributes()
                 .add(Attributes.MAX_HEALTH, 4.0)
                 .add(Attributes.MOVEMENT_SPEED, 0.25)
-                .add(Attributes.FOLLOW_RANGE, 100.0);
+                .add(Attributes.FOLLOW_RANGE, 100.0)
+                .add(Attributes.ATTACK_DAMAGE, 1.0);
     }
 
     /** Registers DATA_USING_ITEM alongside Chicken's existing synced data. */
@@ -147,6 +154,7 @@ public class GregEntity extends Chicken implements RangedAttackMob{
     protected void registerGoals() {
         //super.registerGoals();
         this.goalSelector.addGoal(0, new FloatGoal(this));
+        //this.goalSelector.addGoal(4, new MeleeAttackGoal(this, 1.0, false));
         //this.goalSelector.addGoal(3, new AvoidEntityGoal<>(this, IABoss_monster.class, 20.0F, 1.0, 1.0));
         this.targetSelector.addGoal(1, new NearestAttackableTargetGoal<>(this, LLibrary_Boss_Monster.class, false));
         this.targetSelector.addGoal(1, new NearestAttackableTargetGoal<>(this, IABoss_monster.class, false));
@@ -163,7 +171,47 @@ public class GregEntity extends Chicken implements RangedAttackMob{
             tickBossAlert();
             tickThreatDetection();
             tickPotionDrinking();
+            tickBossRetargetCheck();
         }
+    }
+
+    /**
+     * Checks each tick whether the boss saved in GregSavedData has lost its target.
+     * If the boss entity is loaded but has no target, Greg fires a dodge arrow toward
+     * his own current target to reposition himself. A cooldown prevents repeated firing.
+     */
+    private void tickBossRetargetCheck() {
+        if (retargetDodgeCooldown > 0) {
+            retargetDodgeCooldown--;
+            return;
+        }
+
+        LivingEntity gregTarget = this.getTarget();
+        if (gregTarget == null) return;
+
+        ServerLevel serverLevel = (ServerLevel) this.level();
+        GregSavedData data = GregSavedData.get(serverLevel.getServer());
+        java.util.UUID bossUUID = data.getBossUUID();
+        if (bossUUID == null) return;
+
+        // Find the saved boss across all loaded dimensions
+        net.minecraft.world.entity.Mob boss = null;
+        for (var level : serverLevel.getServer().getAllLevels()) {
+            net.minecraft.world.entity.Entity e = level.getEntity(bossUUID);
+            if (e instanceof net.minecraft.world.entity.Mob m) {
+                boss = m;
+                break;
+            }
+        }
+
+        if (boss == null || boss.getTarget() != null) return;
+
+        // Boss has no target — fire a dodge arrow toward Greg's current target to reposition
+        LOGGER.info("[Greg] Boss has no target, firing retarget dodge arrow toward {}", gregTarget.getType().toShortString());
+        AbstractArrow arrow = fireDodgeArrow(serverLevel, gregTarget.blockPosition());
+        this.dropLeash(true, false);
+        this.setLeashedTo(arrow, true);
+        retargetDodgeCooldown = 40;
     }
 
     /**
@@ -205,30 +253,37 @@ public class GregEntity extends Chicken implements RangedAttackMob{
                 PotionContents contents = held.get(DataComponents.POTION_CONTENTS);
                 if (held.is(Items.POTION) && contents != null) {
                     contents.forEachEffect(this::addEffect);
-                    LOGGER.info("[Greg] Finished drinking potion");
+                    LOGGER.info("[Greg] Finished drinking potion: {}", held.getHoverName().getString());
                 }
                 this.gameEvent(GameEvent.DRINK);
             }
         } else {
             // Decide which potion to drink, in priority order
             ItemStack potion = null;
-            if (!this.hasEffect(MobEffects.FIRE_RESISTANCE)) {
-                potion = PotionContents.createItemStack(Items.POTION, Potions.FIRE_RESISTANCE);
-                LOGGER.info("[Greg] Starting fire resistance potion");
-            } else if (!this.hasEffect(MobEffects.REGENERATION)) {
-                potion = PotionContents.createItemStack(Items.POTION, Potions.REGENERATION);
-                LOGGER.info("[Greg] Starting regeneration potion");
-
+            String potionName = null;
+//            if (!this.hasEffect(MobEffects.FIRE_RESISTANCE)) {
+//                potion = PotionContents.createItemStack(Items.POTION, Potions.FIRE_RESISTANCE);
+//                potionName = "Fire Resistance";
+            if (!this.hasEffect(MobEffects.REGENERATION)) {
+                potion = PotionContents.createItemStack(Items.POTION, Potions.STRONG_REGENERATION);
+                potionName = "Regeneration";
+            } else if (!this.hasEffect(MobEffects.WATER_BREATHING)) {
+                potion = PotionContents.createItemStack(Items.POTION, Potions.LONG_WATER_BREATHING);
+                potionName = "Water Breathing";
+            } else if (!this.hasEffect(MobEffects.DAMAGE_RESISTANCE)) {
+                potion = PotionContents.createItemStack(Items.POTION, Potions.STRONG_TURTLE_MASTER);
+                potionName = "Turtle Master";
             }
 
             if (potion != null) {
                 this.setItemSlot(EquipmentSlot.MAINHAND, potion);
                 this.usingTime = this.getMainHandItem().getUseDuration(this);
                 this.setUsingItem(true);
+                LOGGER.info("[Greg] Starting to drink potion: {}", potionName);
                 this.level().playSound(
                         null, this.getX(), this.getY(), this.getZ(),
                         SoundEvents.WITCH_DRINK, this.getSoundSource(),
-                        1.0F, 0.8F + this.random.nextFloat() * 0.4F
+                        2.0F, 0.8F + this.random.nextFloat() * 0.4F
                 );
             }
         }
@@ -248,13 +303,12 @@ public class GregEntity extends Chicken implements RangedAttackMob{
         serverLevel.getServer().getPlayerList().broadcastSystemMessage(
                 Component.literal("[Greg] Boss alert: " + alert), false);
 
-        if (alert.equals("HARBINGER_CHARGE")) {
-            //setCombatState(CombatState.WIND_CHARGE, 40);
-            LivingEntity target = this.getTarget();
-            if (target != null) {
-                buildWallBox(target, 5);
-            }
+        if (alert.equals("IGNIS_ULTIMATE_ATTACK")){
+            performDodge(serverLevel, data);
+            buildWallBox(this.getTarget(), 5, 100);
+
         }
+
         performDodge(serverLevel, data);
     }
 
@@ -268,16 +322,27 @@ public class GregEntity extends Chicken implements RangedAttackMob{
             threatDodgeCooldown--;
             return;
         }
-        List<Entity> threats = getThreatList();
-        if (threats.isEmpty()) return;
 
-        for (Entity threat : threats){
-            buildWallBox(threat, 1);
-        }
-        LOGGER.info("[Greg] {} threat(s) detected nearby, triggering dodge", threats.size());
         ServerLevel serverLevel = (ServerLevel) this.level();
         GregSavedData data = GregSavedData.get(serverLevel.getServer());
-        performDodge(serverLevel, data);
+
+        List<Entity> threats = getThreatList();
+        if (threats.isEmpty() && this.getTarget() != null) {
+//            dodgeShootLockout = 20;
+//            AbstractArrow arrow = fireDodgeArrow(serverLevel, this.getTarget().getOnPos().above(8));
+//            this.setLeashedTo(arrow, true);
+            return;
+        };
+
+        for (Entity threat : threats){
+            if (threat instanceof Ignis_Entity || threat instanceof Flame_Strike_Entity){
+                performDodge(serverLevel, data);
+            } else if (threat instanceof Ignis_Abyss_Fireball_Entity || threat instanceof Ignis_Fireball_Entity){
+                buildWallBox(threat, 2, 40);
+            }
+        }
+
+        LOGGER.info("[Greg] {} threat(s) detected nearby, triggering dodge", threats.size());
         threatDodgeCooldown = THREAT_DODGE_COOLDOWN;
     }
 
@@ -286,6 +351,12 @@ public class GregEntity extends Chicken implements RangedAttackMob{
      * and leashes Greg to that arrow. Called by both tickBossAlert and tickThreatDetection.
      */
     private void performDodge(ServerLevel serverLevel, GregSavedData data) {
+
+        if (threatDodgeCooldown > 0) {
+            threatDodgeCooldown--;
+            return;
+        }
+
         List<BlockPos> dodgePoints = data.getDodgePoints();
         if (dodgePoints.isEmpty()) {
             LOGGER.info("[Greg] No dodge points set, skipping dodge");
@@ -307,7 +378,6 @@ public class GregEntity extends Chicken implements RangedAttackMob{
         // Fire an arrow toward the target dodge point and leash Greg to it
         AbstractArrow arrow = fireDodgeArrow(serverLevel, target);
         this.setLeashedTo(arrow, true);
-        dodgeShootLockout = 40;
 
         // --- Mount approach (disabled — arrow dismount on ground not reliable) ---
         // if (this.isPassenger()) {
@@ -322,54 +392,57 @@ public class GregEntity extends Chicken implements RangedAttackMob{
     }
 
     /**
-     * Picks a dodge target index from the list, excluding the current index.
-     * If index is -1 (unset), picks the closest point to Greg's current position.
-     * Otherwise scores each candidate as dist²(point, boss) + dist²(point, greg),
-     * choosing the point that is collectively farthest from both — no sqrt needed.
+     * Picks the dodge point furthest from Greg's target that Greg has an unobstructed
+     * line of sight to, excluding the current index.
+     * Falls back to the overall furthest if no visible point exists.
      */
     private int pickDodgeTarget(List<BlockPos> dodgePoints, int currentIndex) {
-        // Pick closest point on first dodge (Greg hasn't moved yet)
-        if (this.getTarget() == null){
+        if (this.getTarget() == null) {
             return 0;
         }
-        int furtherst = 0;
-        double furthestDist = 0;
+
+        BlockPos bossPos = this.getTarget().blockPosition();
+        int bestLosIndex = -1;
+        double bestLosDist = -1;
+        int fallbackIndex = 0;
+        double fallbackDist = -1;
+
         for (int i = 0; i < dodgePoints.size(); i++) {
-            if (i == currentIndex){
-                continue;
+            if (i == currentIndex) continue;
+
+            double dist = bossPos.distSqr(dodgePoints.get(i));
+
+            if (dist > fallbackDist) {
+                fallbackDist = dist;
+                fallbackIndex = i;
             }
-            double dist = this.getTarget().blockPosition().distSqr(dodgePoints.get(i));
-            if (dist > furthestDist) {
-                furthestDist = dist;
-                furtherst = i;
+
+            if (!hasLineOfSightToPos(dodgePoints.get(i))) continue;
+
+            if (dist > bestLosDist) {
+                bestLosDist = dist;
+                bestLosIndex = i;
             }
         }
-        return furtherst;
 
-        //return (currentIndex + 1) % dodgePoints.size();
+        if (bestLosIndex != -1) {
+            return bestLosIndex;
+        }
 
-//        if (this.getTarget() == null) {
-//            return dodgePoints.size() - 1;
-//        }
-//
-//        BlockPos bossPos = this.getTarget().getOnPos();
-//        BlockPos gregPos = this.blockPosition();
-//        int bestInd = -1;
-//        double bestScore = -1;
-//
-//        for (int i = 0; i < dodgePoints.size(); i++) {
-//            if (i == currentIndex) continue;
-//
-//            BlockPos candidate = dodgePoints.get(i);
-//            // Sum of squared distances from both the boss and Greg — maximise to stay far from both
-//            double score = bossPos.distSqr(candidate) + gregPos.distSqr(candidate);
-//            if (score > bestScore) {
-//                bestScore = score;
-//                bestInd = i;
-//            }
-//        }
-//
-//        return bestInd;
+        LOGGER.info("[Greg] No LOS dodge point found, falling back to furthest");
+        return fallbackIndex;
+    }
+
+    /**
+     * Returns true if Greg has an unobstructed block-collision line of sight to the centre of target.
+     * Uses the same COLLIDER shape check that vanilla mob AI uses for visibility.
+     */
+    private boolean hasLineOfSightToPos(BlockPos target) {
+        Vec3 eyePos = this.getEyePosition();
+        Vec3 targetCenter = Vec3.atCenterOf(target);
+        ClipContext ctx = new ClipContext(eyePos, targetCenter, ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, this);
+        BlockHitResult hit = this.level().clip(ctx);
+        return hit.getType() == HitResult.Type.MISS;
     }
 
     /**
@@ -398,10 +471,10 @@ public class GregEntity extends Chicken implements RangedAttackMob{
      * Fires unconditionally once the countdown reaches zero — no line of sight required.
      */
     private void tickRangedAttack() {
-//        if (dodgeShootLockout > 0) {
-//            dodgeShootLockout--;
-//            return;
-//        }
+        if (dodgeShootLockout > 0) {
+            dodgeShootLockout--;
+            return;
+        }
 
         LivingEntity target = this.getTarget();
         if (target == null) {
@@ -432,10 +505,8 @@ public class GregEntity extends Chicken implements RangedAttackMob{
         if (!this.hasLineOfSight(target)){
             return;
         }
-        switch (combatState) {
-            case WIND_CHARGE -> fireWindChargeAt(target);
-            case NORMAL      -> fireSonicBoomAt(target);
-        }
+
+        fireSonicBoomAt(target);
     }
 
     /**
@@ -510,6 +581,52 @@ public class GregEntity extends Chicken implements RangedAttackMob{
         }
 
         LOGGER.info("[Greg] Fired WitherSkull at entity={} pos={}", target.getType().toShortString(), this.blockPosition());
+    }
+
+    /**
+     * Fires a Wither_Homing_Missile_Entity from Greg's eye position toward the given entity.
+     * Mirrors the Harbinger's mlaunch: constructs with (shooter, direction, level, damage, target),
+     * spawns 1 block ahead in the direction of the target.
+     */
+    private void fireWitherHomingMissileAt(LivingEntity target) {
+        double eyeX = this.getX();
+        double eyeY = this.getEyeY();
+        double eyeZ = this.getZ();
+
+        // Aim at the centre of the target's bounding box
+        double aimY = target.getBoundingBox().getCenter().y;
+        Vec3 direction = new Vec3(target.getX() - eyeX, aimY - eyeY, target.getZ() - eyeZ).normalize();
+
+        Wither_Homing_Missile_Entity missile = new Wither_Homing_Missile_Entity(this, direction, this.level(), 10.0F, target);
+        // Spawn 2 blocks ahead of Greg in the direction of the target
+        missile.setPosRaw(eyeX + direction.x * 3, eyeY + direction.y * 3, eyeZ + direction.z * 3);
+        this.level().addFreshEntity(missile);
+
+        LOGGER.info("[Greg] Fired Wither Homing Missile at entity={} pos={}", target.getType().toShortString(), this.blockPosition());
+    }
+
+    /**
+     * Fires an Abyss_Orb_Entity from 2 blocks ahead of Greg toward the given entity.
+     * The orb homes in on the target; damage mirrors the default config value of 4.
+     */
+    private void fireAbyssOrbAt(LivingEntity target) {
+        double eyeX = this.getX();
+        double eyeY = this.getEyeY();
+        double eyeZ = this.getZ();
+
+        // Aim at the centre of the target's bounding box
+        double aimY = target.getBoundingBox().getCenter().y;
+        Vec3 direction = new Vec3(target.getX() - eyeX, aimY - eyeY, target.getZ() - eyeZ).normalize();
+
+        // Spawn 2 blocks ahead of Greg in the direction of the target
+        double spawnX = eyeX + direction.x * 2;
+        double spawnY = eyeY + direction.y * 2;
+        double spawnZ = eyeZ + direction.z * 2;
+
+        Abyss_Orb_Entity orb = new Abyss_Orb_Entity(this, spawnX, spawnY, spawnZ, this.level(), 4.0F, target);
+        this.level().addFreshEntity(orb);
+
+        LOGGER.info("[Greg] Fired Abyss Orb at entity={} pos={}", target.getType().toShortString(), this.blockPosition());
     }
 
     /**
@@ -589,34 +706,35 @@ public class GregEntity extends Chicken implements RangedAttackMob{
      * Placed positions are recorded in {@code activeWallBlocks} and torn down after 80 ticks
      * by the shared {@code tickWall} mechanism.
      */
-    public void buildWallBox(Entity target, int radius) {
+    public void buildWallBox(Entity target, int radius, int timer) {
         ServerLevel serverLevel = (ServerLevel) this.level();
 
         int centerX = target.getBlockX();
         int baseY   = Mth.floor(target.getY());
         int centerZ = target.getBlockZ();
 
-        BlockState wallBlock = Blocks.OBSIDIAN.defaultBlockState();
+        BlockState wallBlock = Blocks.BEDROCK.defaultBlockState();
         int placed = 0;
 
-        // Iterate a 5×5 footprint (-2 to +2 in X and Z); only place on the perimeter
+        // place on the XZ perimeter (sides) and the top/bottom caps
         for (int wx = -radius; wx <= radius; wx++) {
             for (int wz = -radius; wz <= radius; wz++) {
-                if (wx != -radius && wx != radius && wz != -radius && wz != radius) continue; // skip interior
-                for (int h = -radius; h < radius; h++) {
+                for (int h = -radius; h <= radius; h++) {
+                    boolean onXZPerimeter = wx == -radius || wx == radius || wz == -radius || wz == radius;
+                    boolean onYCap = h == -radius || h == radius;
+                    if (!onXZPerimeter && !onYCap) continue; // skip interior
                     BlockPos pos = new BlockPos(centerX + wx, baseY + h, centerZ + wz);
-                    if (serverLevel.getBlockState(pos).isAir()) {
+                    if (serverLevel.getBlockState(pos).isAir() || serverLevel.getBlockState(pos).is(Blocks.WATER)) {
                         serverLevel.setBlock(pos, wallBlock, 3);
-                        activeWallBlocks.add(pos);
+                        activeWallBlocks.put(pos, timer);
                         placed++;
                     }
                 }
             }
         }
 
-        wallBreakTimer = 80;
-        LOGGER.info("[Greg] Built box around boss at {}: {} blocks placed, tears down in 80 ticks",
-                target.blockPosition(), placed);
+        LOGGER.info("[Greg] Built box around {}: {} blocks placed, each expires in {} ticks",
+                target.blockPosition(), placed, timer);
     }
 
     /**
@@ -656,34 +774,42 @@ public class GregEntity extends Chicken implements RangedAttackMob{
                 // Only place in air — never overwrite existing blocks
                 if (serverLevel.getBlockState(pos).isAir()) {
                     serverLevel.setBlock(pos, wallBlock, 3);
-                    activeWallBlocks.add(pos);
+                    activeWallBlocks.put(pos, 80);
                     placed++;
                 }
             }
         }
 
-        wallBreakTimer = 80;
-        LOGGER.info("[Greg] Built wall: {} blocks placed, tears down in 40 ticks", placed);
+        LOGGER.info("[Greg] Built wall: {} blocks placed, each expires in 80 ticks", placed);
     }
 
     /**
-     * Counts down the wall break timer and removes all recorded wall blocks when it expires.
-     * Only removes blocks that are still obsidian — skips any that were already broken externally.
+     * Decrements each active wall block's individual timer every tick.
+     * Blocks whose timer reaches zero are removed from the world and the tracking map.
      */
     private void tickWall() {
         if (activeWallBlocks.isEmpty()) return;
-        if (--wallBreakTimer > 0) return;
 
         ServerLevel serverLevel = (ServerLevel) this.level();
         int broken = 0;
-        for (BlockPos pos : activeWallBlocks) {
-            if (serverLevel.getBlockState(pos).is(Blocks.OBSIDIAN)) {
-                serverLevel.setBlock(pos, Blocks.AIR.defaultBlockState(), 3);
-                broken++;
+        Iterator<Map.Entry<BlockPos, Integer>> it = activeWallBlocks.entrySet().iterator();
+        while (it.hasNext()) {
+            Map.Entry<BlockPos, Integer> entry = it.next();
+            int remaining = entry.getValue() - 1;
+            if (remaining <= 0) {
+                BlockPos pos = entry.getKey();
+                if (serverLevel.getBlockState(pos).is(Blocks.OBSIDIAN) || serverLevel.getBlockState(pos).is(Blocks.BEDROCK)) {
+                    serverLevel.setBlock(pos, Blocks.AIR.defaultBlockState(), 3);
+                    broken++;
+                }
+                it.remove();
+            } else {
+                entry.setValue(remaining);
             }
         }
-        activeWallBlocks.clear();
-        LOGGER.info("[Greg] Wall torn down: {} blocks removed", broken);
+        if (broken > 0) {
+            LOGGER.info("[Greg] tickWall: removed {} expired blocks", broken);
+        }
     }
 
     /**
@@ -723,16 +849,38 @@ public class GregEntity extends Chicken implements RangedAttackMob{
      */
     public List<Entity> getThreatList() {
         List<Entity> threats = new ArrayList<>();
-        var aabb = this.getBoundingBox().inflate(5);
+        var aabb = this.getBoundingBox().inflate(15);
 
         // Netherite Monstrosity projectiles
-        threats.addAll(this.level().getEntitiesOfClass(Flare_Bomb_Entity.class, aabb));
-        threats.addAll(this.level().getEntitiesOfClass(Lava_Bomb_Entity.class, aabb));
+//        threats.addAll(this.level().getEntitiesOfClass(Flare_Bomb_Entity.class, aabb));
+//        threats.addAll(this.level().getEntitiesOfClass(Lava_Bomb_Entity.class, aabb));
 
         // Harbinger projectiles
-        threats.addAll(this.level().getEntitiesOfClass(Laser_Beam_Entity.class, aabb));
-        threats.addAll(this.level().getEntitiesOfClass(Wither_Missile_Entity.class, aabb));
-        threats.addAll(this.level().getEntitiesOfClass(Wither_Homing_Missile_Entity.class, aabb));
+//        threats.addAll(this.level().getEntitiesOfClass(Laser_Beam_Entity.class, aabb));
+//        threats.addAll(this.level().getEntitiesOfClass(Wither_Missile_Entity.class, aabb));
+//        threats.addAll(this.level().getEntitiesOfClass(Wither_Homing_Missile_Entity.class, aabb));
+        // Leviathan projectiles
+//        threats.addAll(this.level().getEntitiesOfClass(Abyss_Blast_Portal_Entity.class, aabb));
+//        threats.addAll(this.level().getEntitiesOfClass(Abyss_Mine_Entity.class, aabb));
+//        threats.addAll(this.level().getEntitiesOfClass(Abyss_Orb_Entity.class, aabb));
+//        threats.addAll(this.level().getEntitiesOfClass(The_Leviathan_Entity.class, aabb));
+//        threats.addAll(this.level().getEntitiesOfClass(Dimensional_Rift_Entity.class, aabb));
+
+        // Ignis projectiles
+        threats.addAll(this.level().getEntitiesOfClass(Ignis_Entity.class, aabb));
+        threats.addAll(this.level().getEntitiesOfClass(Ignis_Fireball_Entity.class, aabb));
+        threats.addAll(this.level().getEntitiesOfClass(Ignis_Abyss_Fireball_Entity.class, aabb));
+        threats.addAll(this.level().getEntitiesOfClass(Flame_Strike_Entity.class, aabb));
+
+//        threats.removeIf(threat -> {
+//            Vec3 targetCenter = threat.getBoundingBox().getCenter();
+//            ClipContext ctx = new ClipContext(this.getEyePosition(), targetCenter, ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, this);
+//            boolean blocked = this.level().clip(ctx).getType() != HitResult.Type.MISS;
+//            if (blocked) {
+//                LOGGER.info("[Greg] Threat blocked by geometry, ignoring: type={} pos={}", threat.getType().toShortString(), threat.blockPosition());
+//            }
+//            return blocked;
+//        });
 
         for (Entity threat : threats) {
             LOGGER.info("[Greg] Threat: type={} pos={}", threat.getType().toShortString(), threat.blockPosition());
@@ -757,7 +905,7 @@ public class GregEntity extends Chicken implements RangedAttackMob{
      */
     @Override
     public boolean handleLeashAtDistance(Entity leashHolder, float distance) {
-        if (distance > 5.0F) {
+        if (distance > 8.0F) {
             this.elasticRangeLeashBehaviour(leashHolder, distance);
         }
         return true;
