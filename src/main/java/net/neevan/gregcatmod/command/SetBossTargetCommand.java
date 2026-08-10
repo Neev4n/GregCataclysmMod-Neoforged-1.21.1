@@ -10,7 +10,7 @@ import net.minecraft.world.entity.Mob;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.EntityHitResult;
 import net.minecraft.world.phys.Vec3;
-import net.neevan.gregcatmod.data.GregSavedData;
+import net.neevan.gregcatmod.util.GregSavedData;
 import net.neoforged.neoforge.entity.PartEntity;
 import net.minecraft.world.entity.projectile.ProjectileUtil;
 import org.slf4j.Logger;

@@ -3,18 +3,29 @@ package net.neevan.gregcatmod.event;
 import com.github.L_Ender.cataclysm.entity.AnimationMonster.BossMonsters.Ignis_Entity;
 import com.github.L_Ender.cataclysm.entity.AnimationMonster.BossMonsters.The_Harbinger_Entity;
 import com.github.L_Ender.cataclysm.entity.AnimationMonster.BossMonsters.The_Leviathan.The_Leviathan_Entity;
+import com.github.L_Ender.cataclysm.entity.InternalAnimationMonster.IABossMonsters.Scylla.Scylla_Ceraunus_Entity;
+import com.github.L_Ender.cataclysm.entity.effect.Wave_Entity;
+import com.github.L_Ender.cataclysm.entity.projectile.Lightning_Spear_Entity;
+import com.github.L_Ender.cataclysm.entity.projectile.Spark_Entity;
+import com.github.L_Ender.cataclysm.entity.projectile.Water_Spear_Entity;
 import com.github.L_Ender.lionfishapi.server.animation.Animation;
 import com.github.L_Ender.lionfishapi.server.event.AnimationEvent;
 import com.mojang.logging.LogUtils;
+import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.Entity;
 import net.neevan.gregcatmod.GregCataclysmMod;
 import net.neevan.gregcatmod.command.*;
-import net.neevan.gregcatmod.data.GregSavedData;
+import net.neevan.gregcatmod.entity.custom.GregEntity;
+import net.neevan.gregcatmod.util.GregSavedData;
+import net.neevan.gregcatmod.util.Util;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.common.EventBusSubscriber;
 import net.neoforged.neoforge.event.RegisterCommandsEvent;
+import net.neoforged.neoforge.event.entity.EntityJoinLevelEvent;
 import org.slf4j.Logger;
+
+import java.util.UUID;
 
 /** Subscribes to game bus events (runtime events, commands, etc.). */
 @EventBusSubscriber(modid = GregCataclysmMod.MODID, bus = EventBusSubscriber.Bus.GAME)
@@ -29,9 +40,67 @@ public class ModGameBusEvents {
         ResetTargettingCommand.register(event.getDispatcher());
         TestAlertCommand.register(event.getDispatcher());
         AddDodgePointCommand.register(event.getDispatcher());
+        RemoveDodgePointCommand.register(event.getDispatcher());
         ClearDodgePointsCommand.register(event.getDispatcher());
         ClearBlocksCommand.register(event.getDispatcher());
         GetBossHealthCommand.register(event.getDispatcher());
+        StartDebuggerCommand.register(event.getDispatcher());
+        StopDebuggerCommand.register(event.getDispatcher());
+    }
+
+    /**
+     * Event-driven threat detection: fires once when a Scylla threat entity spawns, replacing the
+     * old per-tick AABB scan for these types (see plans/threat_revamp_plan.md). If the entity's spawn
+     * velocity puts it on a collision course with Greg (via {@link Util#willProjectileHit}), raises the
+     * one-shot pendingThreatHide signal that GregEntity.tickThreatHide consumes on the next tick. This
+     * is a trajectory test, not line of sight — a threat that can see Greg but flies away from him is
+     * ignored so his single hide isn't spent on a projectile that would miss anyway.
+     *
+     * <p><b>Why a deferred signal instead of hiding Greg directly here:</b> this event fires
+     * mid-addFreshEntity, and the hide fires a ride arrow — another addFreshEntity — reentrantly
+     * during entity add. The one-tick defer through the poll costs nothing (projectile flight time
+     * dwarfs it) and matches the existing pendingBossAlert architecture.
+     *
+     * <p>Also fires on chunk re-load, not just fresh spawns — fine: a re-loaded live projectile
+     * with line of sight is worth one hide.
+     *
+     * <p>No owner filter — none of these five types can be Greg-owned today. The moment one can,
+     * filter {@code getOwner() != greg} here (same trap documented on GregEntity.getThreatList).
+     */
+    @SubscribeEvent
+    public static void onEntityJoinLevel(EntityJoinLevelEvent event) {
+        // Event fires on both sides; only the server runs threat logic
+        if (!(event.getLevel() instanceof ServerLevel serverLevel)) return;
+
+        Entity entity = event.getEntity();
+        if (!(entity instanceof Spark_Entity || entity instanceof Lightning_Spear_Entity
+                || entity instanceof Water_Spear_Entity || entity instanceof Scylla_Ceraunus_Entity
+                || entity instanceof Wave_Entity)) {
+            return;
+        }
+
+        // Resolve Greg in THIS level only — a threat in another dimension is not a threat
+        GregSavedData data = GregSavedData.get(serverLevel.getServer());
+        UUID gregUUID = data.getGregUUID();
+        if (gregUUID == null) return;
+        if (!(serverLevel.getEntity(gregUUID) instanceof GregEntity greg) || !greg.isAlive()) return;
+
+        // Trajectory check, not line of sight: only hide if the threat's current velocity would
+        // actually carry it into Greg before any block stops it. A projectile that can *see* Greg but
+        // is flying away from or past him is not a threat, and hiding from it wastes Greg's one move
+        // (and, with an elevated hide, can sink him into a worse spot). This replaces the old spawn-time
+        // LOS snapshot outright.
+        if (!Util.willProjectileHit(serverLevel, entity, greg)) {
+            LOGGER.info("[Greg] Threat spawned but its trajectory misses Greg, ignoring: type={} pos={} vel={}",
+                    entity.getType().toShortString(), entity.blockPosition(), entity.getDeltaMovement());
+            return;
+        }
+
+        LOGGER.info("[Greg] Threat spawned on a collision course: type={} pos={} — raising hide signal",
+                entity.getType().toShortString(), entity.blockPosition());
+        serverLevel.getServer().getPlayerList().broadcastSystemMessage(
+                Component.literal("[Greg] Threat spawned: " + entity.getType().toShortString()), false);
+        data.setPendingThreatHide();
     }
 
     /**
@@ -47,9 +116,14 @@ public class ModGameBusEvents {
 
         String alertName = null;
 
-        if (entity instanceof The_Harbinger_Entity) {
-            alertName = getHarbingerAlertName(event.getAnimation());
-        } else if (entity instanceof The_Leviathan_Entity) {
+        // Harbinger is handled by HarbingerMixin instead — it injects at aiStep TAIL and so has the
+        // per-tick current animation that GregSavedData.hideAlertActive needs to clear itself. This
+        // route is edge-triggered and cannot clear a flag, so keeping both would only mean two places
+        // to edit and a duplicate alert per animation start.
+//        if (entity instanceof The_Harbinger_Entity) {
+//            alertName = getHarbingerAlertName(event.getAnimation());
+//        } else
+        if (entity instanceof The_Leviathan_Entity) {
             alertName = getLeviathanAlertName(event.getAnimation());
         } else if (entity instanceof Ignis_Entity) {
             alertName = getIgnisAlertName(event.getAnimation());
@@ -137,7 +211,11 @@ public class ModGameBusEvents {
     /**
      * Maps a Harbinger Animation to an alert name string.
      * Returns null for non-attack animations (DEATH, STUN).
+     *
+     * <p>Currently unused — its caller above is commented out because HarbingerMixin owns the
+     * Harbinger route. Kept as the reference mapping; delete both together if the mixin ever goes.
      */
+    @SuppressWarnings("unused")
     private static String getHarbingerAlertName(Animation animation) {
         if (animation == The_Harbinger_Entity.DEATHLASER_ANIMATION)         return "HARBINGER_DEATHLASER";
         if (animation == The_Harbinger_Entity.CHARGE_ANIMATION)             return "HARBINGER_CHARGE";

@@ -8,7 +8,8 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.HitResult;
-import net.neevan.gregcatmod.data.GregSavedData;
+import net.neevan.gregcatmod.util.DodgePointHandler;
+import net.neevan.gregcatmod.util.GregSavedData;
 
 public class AddDodgePointCommand {
 
@@ -34,6 +35,9 @@ public class AddDodgePointCommand {
 
         data.addDodgePoint(pos);
         int index = data.getDodgePoints().size() - 1;
+
+        // If the debugger is running, show the new point immediately without a full respawn
+        DodgePointHandler.onDodgePointAdded(player.serverLevel(), data, pos);
 
         source.sendSuccess(() -> Component.literal(
                 "Dodge point [" + index + "] added at " + pos.getX() + ", " + pos.getY() + ", " + pos.getZ()

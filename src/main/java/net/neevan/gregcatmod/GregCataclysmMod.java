@@ -6,7 +6,7 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.effect.MobEffectInstance;
 import net.minecraft.world.effect.MobEffects;
 import net.minecraft.world.entity.Entity;
-import net.neevan.gregcatmod.data.GregSavedData;
+import net.neevan.gregcatmod.util.GregSavedData;
 import net.neevan.gregcatmod.entity.ModEntities;
 import net.neevan.gregcatmod.entity.custom.GregEntity;
 import net.neoforged.bus.api.IEventBus;

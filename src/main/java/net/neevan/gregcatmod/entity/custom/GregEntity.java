@@ -3,6 +3,10 @@ package net.neevan.gregcatmod.entity.custom;
 
 import com.github.L_Ender.cataclysm.entity.AnimationMonster.BossMonsters.Ignis_Entity;
 import com.github.L_Ender.cataclysm.entity.AnimationMonster.BossMonsters.The_Leviathan.*;
+import com.github.L_Ender.cataclysm.entity.InternalAnimationMonster.IABossMonsters.Maledictus.Maledictus_Entity;
+import com.github.L_Ender.cataclysm.entity.InternalAnimationMonster.IABossMonsters.Scylla.Scylla_Ceraunus_Entity;
+import com.github.L_Ender.cataclysm.entity.effect.Cm_Falling_Block_Entity;
+import com.github.L_Ender.cataclysm.entity.effect.Lightning_Area_Effect_Entity;
 import com.github.L_Ender.cataclysm.entity.effect.Flame_Strike_Entity;
 import com.github.L_Ender.cataclysm.entity.projectile.*;
 import com.mojang.logging.LogUtils;
@@ -17,7 +21,6 @@ import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.ai.attributes.AttributeSupplier;
 import net.minecraft.world.entity.ai.attributes.Attributes;
-import net.minecraft.core.particles.ParticleTypes;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.syncher.EntityDataAccessor;
 import net.minecraft.network.syncher.EntityDataSerializers;
@@ -25,41 +28,32 @@ import net.minecraft.network.syncher.SynchedEntityData;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.sounds.SoundEvents;
 import net.minecraft.world.entity.ai.goal.FloatGoal;
-import net.minecraft.world.entity.ai.goal.MeleeAttackGoal;
-import net.neevan.gregcatmod.data.GregSavedData;
+import net.minecraft.world.level.ClipContext;
+import net.minecraft.world.phys.HitResult;
+import net.neevan.gregcatmod.util.GregSavedData;
+import net.neevan.gregcatmod.util.AttackHandler;
+import net.neevan.gregcatmod.util.DodgeHandler;
+import net.neevan.gregcatmod.util.DodgeSearch;
+import net.neevan.gregcatmod.util.DodgeVisualizer;
 import net.minecraft.util.Mth;
 import net.minecraft.world.item.alchemy.PotionContents;
 import net.minecraft.world.item.alchemy.Potions;
 import net.minecraft.world.level.gameevent.GameEvent;
 import com.github.L_Ender.cataclysm.entity.AnimationMonster.BossMonsters.LLibrary_Boss_Monster;
 import com.github.L_Ender.cataclysm.entity.InternalAnimationMonster.IABossMonsters.IABoss_monster;
-import com.github.L_Ender.cataclysm.init.ModEntities;
-import net.minecraft.world.entity.ai.goal.AvoidEntityGoal;
 import net.minecraft.world.entity.ai.goal.target.NearestAttackableTargetGoal;
 import net.minecraft.world.entity.animal.Chicken;
-import net.minecraft.world.entity.animal.Ocelot;
-import net.minecraft.world.entity.monster.Creeper;
 import net.minecraft.world.entity.monster.RangedAttackMob;
 import net.minecraft.world.entity.projectile.AbstractArrow;
-import net.minecraft.world.entity.projectile.ProjectileUtil;
-import net.minecraft.world.entity.projectile.WitherSkull;
-import net.minecraft.world.entity.projectile.windcharge.WindCharge;
+import net.minecraft.world.entity.projectile.Projectile;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.level.Level;
-import net.minecraft.world.level.block.Blocks;
-import net.minecraft.world.level.block.state.BlockState;
-import net.minecraft.world.level.ClipContext;
-import net.minecraft.world.phys.BlockHitResult;
-import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 import org.slf4j.Logger;
-import javax.annotation.Nullable;
+
 import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.Iterator;
 import java.util.List;
-import java.util.Map;
 
 /**
  * Greg — a custom chicken entity with reduced health (4 HP) and standard movement speed.
@@ -79,36 +73,81 @@ public class GregEntity extends Chicken implements RangedAttackMob{
 
     private static final float ATTACK_RADIUS = 20.0F;
     private static final int ATTACK_INTERVAL = 1; // ticks between shots
-    /** Ticks between threat-triggered dodges; prevents spamming one dodge per tick. */
-    private static final int THREAT_DODGE_COOLDOWN = 20;
-
-    /**
-     * Combat states that alter Greg's ranged attack behaviour.
-     * Add new entries here to introduce further timed overrides.
-     */
-    private enum CombatState {
-        /** Default: fires lava bombs at long range, sonic boom up close. */
-        NORMAL,
-        /** Fires wind charges for {@code combatStateTimer} ticks after a ROCKETPUNCH alert. */
-        WIND_CHARGE
-    }
+    /** Ticks between dodges of any kind; prevents spamming one dodge per tick. Set by DodgeHandler.dodgeArrow. */
+    public static final int THREAT_DODGE_COOLDOWN = 20;
 
     /** Counts down to the next shot; -1 means uninitialised. */
     private int attackTime = -1;
     /** Counts down between threat-triggered dodges; 0 means ready to dodge again. */
     private int threatDodgeCooldown = 0;
-    /** Suppresses wither skull firing for 20 ticks after a dodge to avoid self-damage. */
+    /** Suppresses ranged attacks for 20 ticks after a dodge. Never assigned nonzero — see CLAUDE.md. */
     private int dodgeShootLockout = 0;
     /** Cooldown between boss-retarget dodge arrows; prevents firing every tick. */
     private int retargetDodgeCooldown = 0;
+    /** Minimum ticks between hide arrows; stops tickHide re-firing while one is still in flight. */
+    private int hideRepositionCooldown = 0;
+    /** Consecutive ticks the boss has had line of sight to Greg while hiding; drives LOS_GRACE_TICKS. */
+    private int hideLosTicks = 0;
+    /** Consecutive ticks Greg has had NO line of sight to his target while settled; drives tickLosRecovery. */
+    private int losLostTicks = 0;
+    /** Consecutive ticks Greg has had line of sight but been out of damage range; drives tickRegainDistance. */
+    private int rangeLostTicks = 0;
+    /** True while tickRangedAttack is blocked on line of sight; edge-triggers its one log line. */
+    private boolean holdingFire = false;
+    /** True while tickRangedAttack is blocked by the boss's damage-range cap; edge-triggers its log. */
+    private boolean outOfRange = false;
+    /** Counts down between hazard-escape dodges; 0 means Greg may try to leave a damaging volume again. */
+    private int hazardEscapeCooldown = 0;
 
-    /** Current combat state; determines which attack is fired each cycle. */
-    private CombatState combatState = CombatState.NORMAL;
-    /** Remaining ticks in the current non-NORMAL state; 0 means revert to NORMAL next tick. */
-    private int combatStateTimer = 0;
+    /**
+     * Consecutive ticks of boss line of sight before Greg fires another hide arrow. Hysteresis:
+     * line of sight flickers as the boss moves, and reacting to a single tick of it would thrash.
+     */
+    private static final int LOS_GRACE_TICKS = 5;
+    /** Minimum ticks between hide arrows. Greg cannot walk, so this is his entire correction loop. */
+    private static final int HIDE_REPOSITION_COOLDOWN = 20;
 
-    /** Maps each active wall block position to its remaining ticks before removal. */
-    private final Map<BlockPos, Integer> activeWallBlocks = new HashMap<>();
+    /**
+     * Ticks without line of sight to the target before Greg dodges to try to regain it.
+     *
+     * <p><b>Keep this >= THREAT_DODGE_COOLDOWN.</b> tickLosRecovery only counts while the dodge
+     * cooldown is clear (so a dodge in flight isn't mistaken for a stall), so if the cooldown ever
+     * outlasts this threshold the counter can never reach it and the feature silently stops working.
+     * They are deliberately the same value today, which hides that coupling — hence this note.
+     */
+    private static final int LOS_RECOVERY_TICKS = 40;
+
+    /**
+     * Ticks out of damage range (with line of sight) before Greg dodges closer to the target.
+     *
+     * <p><b>Keep this >= THREAT_DODGE_COOLDOWN</b> — the exact coupling documented on
+     * LOS_RECOVERY_TICKS applies here too: the counter only runs while the dodge cooldown is clear,
+     * so a cooldown that outlasts this threshold makes the feature silently dead.
+     */
+    private static final int RANGE_RECOVERY_TICKS = 40;
+
+    /**
+     * Ticks between hazard-escape dodges. Deliberately far shorter than THREAT_DODGE_COOLDOWN.
+     *
+     * <p>Escaping is the one dodge where Greg is <b>already</b> taking damage: Cataclysm's area
+     * effects apply every 5 ticks, i-frames stretch that to a landed hit every ~10-20, and 4 HP buys
+     * him about three of them. Gating an escape behind the 20-tick alert-paced cooldown would cost him
+     * one or two of those three. This is a separate timer rather than a bypass because the shared
+     * cooldown exists for a real reason — ungated dodges left Greg permanently in transit — and the
+     * fix is a gate sized to the damage cadence, not the absence of one.
+     */
+    public static final int HAZARD_ESCAPE_COOLDOWN = 5;
+
+    /**
+     * The single dodge/hide target Greg was last sent to — null when unset. This is the <b>stand spot</b>
+     * (where Greg ends up), not the block an arrow embeds in, so hysteresis and the "am I there yet"
+     * check compare against where he actually lands. Held on the entity, not persisted.
+     *
+     * <p>Used by both the dynamic {@link DodgeSearch} pickers and the hand-placed list fallback: the
+     * list pickers exclude the current target by matching this BlockPos against their points, via
+     * {@code DodgeHandler.effectiveExcludeIndex}. One exclusion signal, no separate index.
+     */
+    private BlockPos currentDodgeTarget = null;
 
     /** Constructs Greg and logs which dimension and side (client/server) he was created on. */
     public GregEntity(EntityType<? extends Chicken> entityType, Level level) {
@@ -161,18 +200,219 @@ public class GregEntity extends Chicken implements RangedAttackMob{
         LOGGER.info("[Greg] Registered goals");
     }
 
+    /**
+     * Runs Greg's server-side behaviour each tick.
+     *
+     * <p>The dodge triggers are ordered by urgency, because they share threatDodgeCooldown and tick
+     * order is what breaks a tie:
+     * <ol>
+     *   <li>tickHazardEscape — Greg is already losing health. Beats everything
+     *   <li>tickThreatHide — a projectile that saw Greg at spawn is already in flight; beats
+     *       "an attack animation started". Sits in the slot tickHide occupied
+     *   <li>tickBossAlert / tickThreatDetection — an attack is incoming
+     *   <li>tickLosRecovery / tickRegainDistance — last, because "I'm not currently shooting" is the
+     *       least urgent of these. Their conditions are mutually exclusive (one needs line of sight,
+     *       the other its absence), so their relative order is documentation: sight before range
+     * </ol>
+     *
+     * <p>tickHide (the sustained hide loop) is suppressed for now — see
+     * plans/threat_revamp_plan.md. Known cost: the Harbinger's DEATHLASER goes unanswered;
+     * re-enable it (and the isHideAlertActive gate in tickThreatHide) before a Harbinger rematch.
+     */
     @Override
     public void tick() {
         super.tick();
         if (!this.level().isClientSide()) {
-            tickCombatState();
-            tickWall();
-            tickRangedAttack();
-            tickBossAlert();
-            tickThreatDetection();
-            tickPotionDrinking();
-            tickBossRetargetCheck();
+            //tickCooldowns();
+            //tickGrabEscape();
+            //tickRangedAttack();
+            //tickHazardEscape();
+            //tickHide();
+            //tickThreatHide();
+            //tickBossAlert();
+            //tickThreatDetection();
+            //tickLosRecovery();
+            //tickRegainDistance();
+            //tickPotionDrinking();
         }
+    }
+
+    /**
+     * Counts the threat-dodge cooldown down once per tick — the single place it decrements.
+     * Consumers (tickThreatDetection, DodgeHandler.dodgeArrow) only ever read it and set it.
+     * Previously each of them decremented it themselves, so on a tick carrying an alert the counter
+     * burned twice and a "20 tick" gate really lasted 10 — and only during alert storms, which made
+     * the effective rate limit depend on how busy the boss was.
+     */
+    private void tickCooldowns() {
+        if (threatDodgeCooldown > 0) {
+            threatDodgeCooldown--;
+        }
+        // Same rule as above: this is the only place it counts down. DodgeHandler.dodgeEscape is the
+        // only writer.
+        if (hazardEscapeCooldown > 0) {
+            hazardEscapeCooldown--;
+        }
+    }
+
+    /**
+     * Breaks Scylla's anchor-hook grab. Her {@code Scylla_Ceraunus_Entity} (the thrown anchor) forces
+     * whatever it hits to {@code startRiding} it, then reels the passenger back to Scylla for the
+     * {@code grab_smash} attack (state 27) — 20 damage, a one-shot on Greg's 4 HP. Once he is a
+     * passenger his motion is fully overridden, so no dodge can escape: the leash physics every other
+     * escape relies on does not run on a riding entity. The only counter is to dismount immediately.
+     *
+     * <p>Runs first of all the tickers (right after cooldowns) because being grabbed outranks every
+     * other threat — Greg is already committed to a lethal sequence the instant the anchor connects.
+     */
+    private void tickGrabEscape() {
+        // Only the anchor grab locks Greg as a passenger; ignore any other vehicle.
+        if (this.getVehicle() instanceof Scylla_Ceraunus_Entity anchor) {
+            LOGGER.info("[Greg] Grabbed by Scylla anchor (id={}) — dismounting", anchor.getId());
+            this.stopRiding();
+        }
+    }
+
+    /**
+     * Keeps Greg out of the boss's line of sight while a hide alert is active (currently only the
+     * Harbinger's 124-tick DEATHLASER, which terrain blocks entirely). Fires a dodge arrow toward a
+     * point Greg can see but the boss cannot; if line of sight is re-established while the alert is
+     * still up, he repositions again.
+     *
+     * <p>Greg has no movement goals — every metre is leash physics — so this reposition loop is his
+     * only correction mechanism. An arrow that leaves him short of cover is fixed by the next arrow,
+     * not by walking, which is why LOS_GRACE_TICKS and HIDE_REPOSITION_COOLDOWN carry the whole
+     * feedback loop: too slow and he stays exposed, too fast and he oscillates in transit.
+     */
+    private void tickHide() {
+        ServerLevel serverLevel = (ServerLevel) this.level();
+        GregSavedData data = GregSavedData.get(serverLevel.getServer());
+
+        if (!data.isHideAlertActive()) {
+            // Reset the loop so the next laser starts clean rather than mid-hysteresis
+            hideRepositionCooldown = 0;
+            hideLosTicks = 0;
+            return;
+        }
+
+        // The boss is the saved bossUUID, not getTarget() — pickHidePoint must test the same entity
+        // this method checks line of sight against, or the two disagree and the loop never converges
+        LivingEntity boss = resolveSavedBoss(serverLevel, data);
+        if (boss == null || !boss.isAlive() || boss.level() != this.level()) {
+            // A dead or unloaded boss stops ticking HarbingerMixin, which would otherwise clear the
+            // flag — so Greg clears it himself rather than hiding forever from nothing
+            LOGGER.info("[Greg] Hide alert active but boss is gone, clearing flag");
+            data.setHideAlertActive(false);
+            return;
+        }
+
+        if (hideRepositionCooldown > 0) {
+            hideRepositionCooldown--;
+            return;
+        }
+
+        // Already hidden — nothing to do, and reset the grace counter
+        if (!this.hasLineOfSight(boss)) {
+            hideLosTicks = 0;
+            return;
+        }
+
+        // Exposed, but wait out the grace window: line of sight flickers as the boss moves
+        if (++hideLosTicks < LOS_GRACE_TICKS) return;
+
+        // Dynamic search first: the nearest reachable spot the boss can't see. Ride the arrow to its
+        // impact block, which lands Greg at the block face (not ~6 blocks short like the leash), so he
+        // arrives where the search proved he is occluded. Retires block_laser_plan concern 1.
+        DodgeSearch.Candidate cand = DodgeSearch.pickDynamicHide(this, boss, currentDodgeTarget);
+        if (cand != null) {
+            currentDodgeTarget = cand.stand();
+            DodgeHandler.launchRide(this, serverLevel, cand.impact());
+            hideLosTicks = 0;
+            hideRepositionCooldown = HIDE_REPOSITION_COOLDOWN;
+            LOGGER.info("[Greg] Hiding at {} (impact {}) from boss={}", cand.stand(), cand.impact(), boss.getType().toShortString());
+            serverLevel.getServer().getPlayerList().broadcastSystemMessage(
+                    Component.literal("[Greg] Hiding at " + cand.stand()), false);
+            return;
+        }
+
+        // Fallback: hand-placed dodge points, for arenas the ray-fan can't solve
+        List<BlockPos> dodgePoints = data.getDodgePoints();
+        if (dodgePoints.isEmpty()) {
+            LOGGER.info("[Greg] Hide alert active but ray-fan found nothing and no dodge points set");
+            return;
+        }
+
+        int targetIndex = DodgeHandler.pickHidePoint(this, boss, dodgePoints, currentDodgeTarget);
+        if (targetIndex == -1) {
+            // Distinct from "already hidden" and "hide arrow fired" — the boss can see every point
+            LOGGER.info("[Greg] No hide point available (ray-fan empty, every dodge point visible to the boss or unreachable)");
+            return;
+        }
+
+        BlockPos target = dodgePoints.get(targetIndex);
+        currentDodgeTarget = target;
+        DodgeHandler.launchRide(this, serverLevel, target);
+        hideLosTicks = 0;
+        hideRepositionCooldown = HIDE_REPOSITION_COOLDOWN;
+
+        LOGGER.info("[Greg] Hiding at fallback point [{}] at {} from boss={}", targetIndex, target, boss.getType().toShortString());
+        serverLevel.getServer().getPlayerList().broadcastSystemMessage(
+                Component.literal("[Greg] Hiding at point [" + targetIndex + "]"), false);
+    }
+
+    /**
+     * Consumes the one-shot threat-hide signal raised by ModGameBusEvents.onEntityJoinLevel when a
+     * Scylla threat projectile spawned with line of sight to Greg, and hides once via
+     * DodgeHandler.hideOnce. See plans/threat_revamp_plan.md.
+     *
+     * <p><b>Poll before gates</b> — the signal must not survive a gated tick and fire stale: a
+     * projectile that spawned during cooldown is 20 ticks closer or already gone by the time the
+     * gate opens, and acting on it then is dodging a ghost.
+     *
+     * <p><b>Deliberately NO isHideAlertActive gate — load-bearing, not an omission.</b> With
+     * tickHide suppressed, IABossAlertMixin still rewrites hideAlertActive every Scylla tick, and
+     * her hide-states (8, 9, 11) are precisely the states that throw these projectiles — gating on
+     * the flag would disable this hide during every volley, exactly when it exists to fire. If
+     * tickHide is ever re-enabled, re-add the gate (a sustained hide owns the leash; two hide
+     * writers would fight over setLeashedTo).
+     */
+    private void tickThreatHide() {
+        ServerLevel serverLevel = (ServerLevel) this.level();
+        GregSavedData data = GregSavedData.get(serverLevel.getServer());
+
+        if (!data.pollPendingThreatHide()) return;
+
+        // Read-only gate; hideOnce re-checks and is the writer. Bailing here just skips the boss
+        // resolve below during the volley window.
+        if (threatDodgeCooldown > 0) return;
+
+        // Hide from the saved boss, not getTarget() — same rule as tickHide: the projectile flew
+        // from the boss, so occlusion from the boss stands in for occlusion from its path
+        LivingEntity boss = resolveSavedBoss(serverLevel, data);
+        if (boss == null || !boss.isAlive() || boss.level() != this.level()) {
+            LOGGER.info("[Greg] Threat hide signal but no live saved boss to hide from, ignoring");
+            return;
+        }
+
+        DodgeHandler.hideOnce(this, data, boss);
+    }
+
+    /**
+     * Resolves the boss recorded by /setBossTarget, searching every loaded dimension.
+     * Returns null if none is set or it isn't loaded — callers bail rather than falling back to
+     * getTarget(), which could be a different entity entirely.
+     */
+    @javax.annotation.Nullable
+    private LivingEntity resolveSavedBoss(ServerLevel serverLevel, GregSavedData data) {
+        java.util.UUID bossUUID = data.getBossUUID();
+        if (bossUUID == null) return null;
+
+        for (var level : serverLevel.getServer().getAllLevels()) {
+            if (level.getEntity(bossUUID) instanceof LivingEntity living) {
+                return living;
+            }
+        }
+        return null;
     }
 
     /**
@@ -208,33 +448,10 @@ public class GregEntity extends Chicken implements RangedAttackMob{
 
         // Boss has no target — fire a dodge arrow toward Greg's current target to reposition
         LOGGER.info("[Greg] Boss has no target, firing retarget dodge arrow toward {}", gregTarget.getType().toShortString());
-        AbstractArrow arrow = fireDodgeArrow(serverLevel, gregTarget.blockPosition());
+        AbstractArrow arrow = DodgeHandler.fireDodgeArrow(this, serverLevel, gregTarget.blockPosition());
         this.dropLeash(true, false);
         this.setLeashedTo(arrow, true);
         retargetDodgeCooldown = 40;
-    }
-
-    /**
-     * Counts down the combat state timer each tick and reverts to NORMAL when it expires.
-     * Runs before tickRangedAttack so the correct state is always used for the current tick.
-     */
-    private void tickCombatState() {
-        if (combatState == CombatState.NORMAL) return;
-        if (--combatStateTimer <= 0) {
-            LOGGER.info("[Greg] Combat state {} expired, reverting to NORMAL", combatState);
-            combatState = CombatState.NORMAL;
-            combatStateTimer = 0;
-        }
-    }
-
-    /**
-     * Transitions Greg into the given combat state for {@code durationTicks} ticks.
-     * If the same state is already active, the timer is refreshed rather than stacked.
-     */
-    private void setCombatState(CombatState state, int durationTicks) {
-        LOGGER.info("[Greg] Combat state {} -> {} for {} ticks", combatState, state, durationTicks);
-        combatState = state;
-        combatStateTimer = durationTicks;
     }
 
     /**
@@ -267,11 +484,12 @@ public class GregEntity extends Chicken implements RangedAttackMob{
             if (!this.hasEffect(MobEffects.REGENERATION)) {
                 potion = PotionContents.createItemStack(Items.POTION, Potions.STRONG_REGENERATION);
                 potionName = "Regeneration";
-            } else if (!this.hasEffect(MobEffects.WATER_BREATHING)) {
-                potion = PotionContents.createItemStack(Items.POTION, Potions.LONG_WATER_BREATHING);
-                potionName = "Water Breathing";
+
             } else if (!this.hasEffect(MobEffects.DAMAGE_RESISTANCE)) {
                 potion = PotionContents.createItemStack(Items.POTION, Potions.STRONG_TURTLE_MASTER);
+                potionName = "Turtle Master";
+            } else if (!this.hasEffect(MobEffects.FIRE_RESISTANCE)) {
+                potion = PotionContents.createItemStack(Items.POTION, Potions.LONG_FIRE_RESISTANCE);
                 potionName = "Turtle Master";
             }
 
@@ -303,13 +521,45 @@ public class GregEntity extends Chicken implements RangedAttackMob{
         serverLevel.getServer().getPlayerList().broadcastSystemMessage(
                 Component.literal("[Greg] Boss alert: " + alert), false);
 
-        if (alert.equals("IGNIS_ULTIMATE_ATTACK")){
-            performDodge(serverLevel, data);
-            buildWallBox(this.getTarget(), 5, 100);
-
+        // tickHide owns Greg's movement while hiding. dodgeArrow picks a point the boss CAN see, so
+        // letting it run here would fight tickHide over the leash — setLeashedTo just overwrites, so
+        // whichever fired last would win at random. The alert is still polled and broadcast above.
+        if (data.isHideAlertActive()) {
+            LOGGER.info("[Greg] Hide alert active, suppressing alert dodge");
+            return;
         }
 
-        performDodge(serverLevel, data);
+        // Pre-empt Scylla's anchor throw. States 13 (ANCHOR_SHOT) and 14 (ANCHOR_SHOT_PULL) fire this
+        // alert BEFORE the Scylla_Ceraunus_Entity spawns; the anchor then flies straight at Greg and its
+        // impact deals 16 storm_bringer damage — a one-shot on a 4 HP chicken. A plain dodge keeps line
+        // of sight, so the fast anchor just tracks to his new spot and connects anyway (killed Greg
+        // repeatedly 2026-07-24). Hiding instead breaks line of sight to the boss now, while the anchor
+        // still doesn't exist, so when it launches it embeds in the interposed terrain (onHitBlock) and
+        // bounces back to Scylla without ever reaching him. Matches ANCHOR_SHOT and ANCHOR_SHOT_PULL but
+        // NOT ANCHOR_EXPLOSION (state 18, a boss-centred nova the dodge's proximity floor handles).
+        if (alert.contains("ANCHOR_SHOT")) {
+            LivingEntity boss = resolveSavedBoss(serverLevel, data);
+            if (boss != null && boss.isAlive() && boss.level() == this.level()) {
+                LOGGER.info("[Greg] Anchor-shot alert — pre-empting with a hide instead of a dodge");
+                DodgeHandler.hideOnce(this, data, boss);
+                return;
+            }
+            LOGGER.info("[Greg] Anchor-shot alert but no live saved boss to hide from — falling back to dodge");
+        }
+
+        // Scylla's lightning_explosion (state 9): a boss-tracked sky barrage. Prefer breaking line of
+        // sight so terrain eats it; if the arena has no cover, dodge as far from the boss as possible
+        // rather than stand in the strike zone.
+        if (alert.contains("LIGHTNING_EXPLOSION")) {
+            LivingEntity boss = resolveSavedBoss(serverLevel, data);
+            if (boss != null && boss.isAlive() && boss.level() == this.level()) {
+                DodgeHandler.hideElseDodgeFar(this, data, boss, "Lightning explosion");
+                return;
+            }
+            LOGGER.info("[Greg] Lightning-explosion alert but no live saved boss to hide from — falling back to dodge");
+        }
+
+        DodgeHandler.dodgeArrow(this, data);
     }
 
     /**
@@ -318,157 +568,235 @@ public class GregEntity extends Chicken implements RangedAttackMob{
      * prevents re-triggering for every tick the threat remains in range.
      */
     private void tickThreatDetection() {
+        ServerLevel serverLevel = (ServerLevel) this.level();
+        GregSavedData data = GregSavedData.get(serverLevel.getServer());
+
+        // Suppressed while hiding, for the same reason as tickBossAlert — this dodge would fight
+        // tickHide over the leash. Checked before the threat scan below to skip its per-entity clips.
+        if (data.isHideAlertActive()) {
+            return;
+        }
+
+        // Read-only gate; tickCooldowns owns the decrement and dodgeArrow owns the reset
         if (threatDodgeCooldown > 0) {
-            threatDodgeCooldown--;
+            return;
+        }
+
+        List<Entity> threats = getThreatList();
+
+        if (threats.isEmpty()){
+            return;
+        }
+
+//        for (Entity threat : threats){
+//        }
+
+        LOGGER.info("[Greg] {} threat(s) detected nearby, triggering dodge", threats.size());
+        // dodgeArrow sets the cooldown itself now — setting it here too would be a second writer
+        DodgeHandler.dodgeArrow(this, data);
+    }
+
+    /**
+     * Dodges when Greg has been unable to see his target for LOS_RECOVERY_TICKS consecutive ticks, so
+     * a bad landing can't silently stop him firing.
+     *
+     * <p><b>Why this is needed:</b> tickRangedAttack self-gates on hasLineOfSight and has no timeout,
+     * Greg has no movement goals (every metre comes from a dodge leash), and the leash drops him
+     * within ~6 blocks of the arrow rather than on the point — so pickDodgeTarget can verify line of
+     * sight for the point and Greg can still land somewhere that doesn't share it. Without this he
+     * stands there doing nothing until the next alert happens to move him.
+     *
+     * <p>This is a <b>retry loop, not a fix</b>: it bounds the stall at ~20 ticks instead of forever.
+     * hasLineOfSight clips eye-to-eye while pickDodgeTarget clips boss-block to point-block, so the
+     * two can disagree and a recovery dodge may land Greg somewhere equally blind.
+     *
+     * <p>Runs last of the dodge triggers so alerts and incoming projectiles win the shared cooldown.
+     */
+    private void tickLosRecovery() {
+        ServerLevel serverLevel = (ServerLevel) this.level();
+        GregSavedData data = GregSavedData.get(serverLevel.getServer());
+
+        // Hiding is the deliberate opposite of this: tickHide is actively breaking line of sight to
+        // survive the Harbinger's 124-tick DEATHLASER. Firing a recovery dodge would put Greg back in
+        // it. This guard is the whole reason the feature isn't lethal.
+        if (data.isHideAlertActive()) {
+            losLostTicks = 0;
+            return;
+        }
+
+        LivingEntity target = this.getTarget();
+        // Only count while settled. A dodge in flight has no line of sight for entirely normal
+        // reasons, and the dodge cooldown is already the "Greg is in transit" signal — reusing it
+        // beats adding a second timer. See LOS_RECOVERY_TICKS for the coupling this creates.
+        if (target == null || threatDodgeCooldown > 0 || this.hasLineOfSight(target)) {
+            losLostTicks = 0;
+            return;
+        }
+
+        if (++losLostTicks >= LOS_RECOVERY_TICKS) {
+            LOGGER.info("[Greg] No line of sight to {} for {} ticks — dodging to regain it",
+                    target.getType().toShortString(), losLostTicks);
+            // Reset on attempt, not on success: dodgeArrow can decline (cooldown, no points,
+            // pickDodgeTarget returning -1) and reports nothing back, so this is what gives a
+            // predictable one-attempt-per-LOS_RECOVERY_TICKS cadence instead of a per-tick retry.
+            losLostTicks = 0;
+            // dodgeRegainLos, not dodgeArrow: it falls back to the nearest-to-boss point Greg can see
+            // from eye level when pickDodgeTarget finds nothing, which is the state Greg gets stuck in.
+            DodgeHandler.dodgeRegainLos(this, data);
+        }
+    }
+
+    /**
+     * Dodges closer to the target when Greg has had line of sight but been beyond the boss's
+     * damage-range cap for RANGE_RECOVERY_TICKS consecutive ticks — the symmetric twin of
+     * tickLosRecovery, covering the other reason tickRangedAttack goes silent. Without it Greg
+     * stands out of range indefinitely (2026-07-22 log: "Holding fire — scylla beyond damage range
+     * (23.7 > 12.2 blocks)" until the next alert happened to move him), and pickDynamicDodge's
+     * tier-2 "escape past range to survive" comment promises a re-close that nothing delivered.
+     * See plans/distance_recover_plan.md.
+     *
+     * <p>The two conditions are mutually exclusive on any tick (this one requires line of sight,
+     * tickLosRecovery requires its absence), so the tickers never both fire; running after it is
+     * documentation of relative urgency, not a behavioural tie-break.
+     *
+     * <p>Like tickLosRecovery this is a <b>retry loop, not a fix</b>: the pick measures range
+     * against the boss's position at pick time and the boss moves during the ride, so a landing can
+     * be out of range again — bounded at one attempt per RANGE_RECOVERY_TICKS, and
+     * pickDynamicApproach's strictly-closer tier means each retry starts nearer.
+     */
+    private void tickRegainDistance() {
+        ServerLevel serverLevel = (ServerLevel) this.level();
+        GregSavedData data = GregSavedData.get(serverLevel.getServer());
+
+        // Load-bearing, same as in tickLosRecovery: during Scylla's volley states the mixin holds
+        // hideAlertActive true (even with tickHide suppressed), and "move closer to the boss
+        // mid-volley" is exactly wrong. Keep this guard even while tickHide is commented out.
+        if (data.isHideAlertActive()) {
+            rangeLostTicks = 0;
+            return;
+        }
+
+        LivingEntity target = this.getTarget();
+        // Only count while settled and able to see the target: no LOS is tickLosRecovery's
+        // jurisdiction, and a dodge in flight is legitimately wherever it is (the cooldown is
+        // already the "in transit" signal — see RANGE_RECOVERY_TICKS for the coupling).
+        if (target == null || threatDodgeCooldown > 0 || !this.hasLineOfSight(target)
+                || this.distanceToSqr(target) <= effectiveRangeLimitSq(target)) {
+            rangeLostTicks = 0;
+            return;
+        }
+
+        if (++rangeLostTicks >= RANGE_RECOVERY_TICKS) {
+            LOGGER.info("[Greg] Out of damage range of {} for {} ticks ({} > {} blocks) — dodging closer",
+                    target.getType().toShortString(), rangeLostTicks,
+                    String.format("%.1f", Math.sqrt(this.distanceToSqr(target))),
+                    String.format("%.1f", Math.sqrt(effectiveRangeLimitSq(target))));
+            // Reset on attempt, not success — same cadence rule as tickLosRecovery
+            rangeLostTicks = 0;
+            DodgeHandler.dodgeRegainDistance(this, data);
+        }
+    }
+
+    /**
+     * Returns the damaging volumes Greg is currently standing in.
+     *
+     * <p><b>Deliberately not part of getThreatList.</b> That method asks "is something flying at me"
+     * and answers it with a line-of-sight clip to the threat's centre — which is exactly wrong here:
+     * a cloud Greg is standing in can have its centre behind terrain and be discarded as "blocked"
+     * while it burns him. Different question, different geometry, different response.
+     *
+     * <p>The test is <b>AABB intersection</b>, not distance-vs-radius, because that is what the hazard
+     * itself uses: Lightning_Area_Effect_Entity damages via
+     * {@code getEntitiesOfClass(LivingEntity.class, this.getBoundingBox())}, and setRadius keeps that
+     * box in sync through refreshDimensions. Mirroring it means our answer can never disagree with the
+     * game's at the edges. Passing Greg's own bounding box to getEntitiesOfClass is the same test from
+     * the other side.
+     *
+     * <p><b>Waiting hazards count.</b> Scylla spawns hers with waitTime = 20, so it exists and renders
+     * for a full second before dealing any damage. That telegraph is the only comfortable escape
+     * window Greg gets — he takes ~4 damage per application out of 4 HP, so reacting to the first hit
+     * is already nearly too late. Do not gate this on isWaiting().
+     */
+    public List<Entity> getOccupiedHazards() {
+        List<Entity> hazards = new ArrayList<>(
+                this.level().getEntitiesOfClass(Lightning_Area_Effect_Entity.class, this.getBoundingBox()));
+
+        // Candidates for later, once the mechanism is proven on the one hazard that has actually
+        // killed Greg. Wave_Entity is a moving volume with its own lifespan; Lightning_Storm_Entity is
+        // a telegraphed strike. Cm_Falling_Block_Entity is NOT a volume and belongs in getThreatList.
+        // hazards.addAll(this.level().getEntitiesOfClass(Wave_Entity.class, this.getBoundingBox()));
+
+        return hazards;
+    }
+
+    /**
+     * Gets Greg out of any damaging volume he is standing in.
+     *
+     * <p>Runs <b>before every other dodge trigger, including tickHide</b>. Standing in a hazard is the
+     * only situation where Greg is already losing health, and "I am taking damage now" strictly
+     * dominates "I may take damage soon". The hide it can pre-empt has 124 ticks to re-establish
+     * itself; a lightning field kills a 4 HP chicken in about three hits. In practice the two cannot
+     * co-occur today — hiding is Harbinger-only and the Harbinger has no radius hazards — so this
+     * ordering costs nothing and is here to be correct when that stops being true.
+     *
+     * <p>Added after Scylla's lightning field killed Greg while he stood in it firing missiles, with
+     * no system able to notice. See plans/radius_threat_plan.md.
+     */
+    private void tickHazardEscape() {
+        List<Entity> hazards = getOccupiedHazards();
+        if (hazards.isEmpty()) {
             return;
         }
 
         ServerLevel serverLevel = (ServerLevel) this.level();
         GregSavedData data = GregSavedData.get(serverLevel.getServer());
+        DodgeHandler.dodgeEscape(this, data, hazards);
+    }
 
-        List<Entity> threats = getThreatList();
-        if (threats.isEmpty() && this.getTarget() != null) {
-//            dodgeShootLockout = 20;
-//            AbstractArrow arrow = fireDodgeArrow(serverLevel, this.getTarget().getOnPos().above(8));
-//            this.setLeashedTo(arrow, true);
-            return;
-        };
-
-        for (Entity threat : threats){
-            if (threat instanceof Ignis_Entity || threat instanceof Flame_Strike_Entity){
-                performDodge(serverLevel, data);
-            } else if (threat instanceof Ignis_Abyss_Fireball_Entity || threat instanceof Ignis_Fireball_Entity){
-                buildWallBox(threat, 2, 40);
-            }
-        }
-
-        LOGGER.info("[Greg] {} threat(s) detected nearby, triggering dodge", threats.size());
-        threatDodgeCooldown = THREAT_DODGE_COOLDOWN;
+    /** Returns the hazard-escape cooldown; 0 means Greg may attempt another escape. */
+    public int getHazardEscapeCooldown() {
+        return hazardEscapeCooldown;
     }
 
     /**
-     * Core dodge logic: picks the next dodge point, fires an arrow toward it,
-     * and leashes Greg to that arrow. Called by both tickBossAlert and tickThreatDetection.
+     * Sets the hazard-escape cooldown. DodgeHandler.dodgeEscape is the only writer and sets it on
+     * attempt; tickCooldowns owns the decrement. Do not decrement through this setter.
      */
-    private void performDodge(ServerLevel serverLevel, GregSavedData data) {
+    public void setHazardEscapeCooldown(int ticks) {
+        this.hazardEscapeCooldown = ticks;
+    }
 
-        if (threatDodgeCooldown > 0) {
-            threatDodgeCooldown--;
-            return;
-        }
+    /** Returns the stand spot the dynamic search last sent Greg to (null if unset). */
+    @javax.annotation.Nullable
+    public BlockPos getCurrentDodgeTarget() {
+        return currentDodgeTarget;
+    }
 
-        List<BlockPos> dodgePoints = data.getDodgePoints();
-        if (dodgePoints.isEmpty()) {
-            LOGGER.info("[Greg] No dodge points set, skipping dodge");
-            return;
-        }
+    /** Records where the dynamic search sent Greg. Called by DodgeHandler/DodgeSearch after a dodge fires. */
+    public void setCurrentDodgeTarget(@javax.annotation.Nullable BlockPos target) {
+        this.currentDodgeTarget = target;
+    }
 
-        // Drop existing leash if present
-        if (this.isLeashed()) {
-            this.dropLeash(true, false);
-            LOGGER.info("[Greg] Dropped existing leash");
-        }
-
-        // Pick target dodge point — any point except the current index
-        int currentIndex = data.getCurrentDodgeIndex();
-        int targetIndex = pickDodgeTarget(dodgePoints, currentIndex);
-        BlockPos target = dodgePoints.get(targetIndex);
-        data.setCurrentDodgeIndex(targetIndex);
-
-        // Fire an arrow toward the target dodge point and leash Greg to it
-        AbstractArrow arrow = fireDodgeArrow(serverLevel, target);
-        this.setLeashedTo(arrow, true);
-
-        // --- Mount approach (disabled — arrow dismount on ground not reliable) ---
-        // if (this.isPassenger()) {
-        //     this.stopRiding();
-        //     LOGGER.info("[Greg] Stopped riding previous arrow");
-        // }
-        // this.startRiding(arrow, true);
-
-        LOGGER.info("[Greg] Dodging to point [{}] at {} via arrow", targetIndex, target);
-        serverLevel.getServer().getPlayerList().broadcastSystemMessage(
-                Component.literal("[Greg] Dodging to point [" + targetIndex + "]"), false);
+    /** Returns the remaining threat-dodge cooldown ticks. Used by DodgeHandler to gate dodges. */
+    public int getThreatDodgeCooldown() {
+        return threatDodgeCooldown;
     }
 
     /**
-     * Picks the dodge point furthest from Greg's target that Greg has an unobstructed
-     * line of sight to, excluding the current index.
-     * Falls back to the overall furthest if no visible point exists.
+     * Sets the threat-dodge cooldown. Two writers: DodgeHandler starts it on a dodge attempt, and
+     * IABossAlertMixin clears it to 0 on a priority dodge state (IABossStateNames.isPriorityDodgeState)
+     * so that state's alert dodge cannot be gated by a cooldown left over from earlier in a volley.
+     * The countdown itself belongs to tickCooldowns; do not decrement through this setter, or the
+     * counter drains faster than once per tick again.
      */
-    private int pickDodgeTarget(List<BlockPos> dodgePoints, int currentIndex) {
-        if (this.getTarget() == null) {
-            return 0;
-        }
-
-        BlockPos bossPos = this.getTarget().blockPosition();
-        int bestLosIndex = -1;
-        double bestLosDist = -1;
-        int fallbackIndex = 0;
-        double fallbackDist = -1;
-
-        for (int i = 0; i < dodgePoints.size(); i++) {
-            if (i == currentIndex) continue;
-
-            double dist = bossPos.distSqr(dodgePoints.get(i));
-
-            if (dist > fallbackDist) {
-                fallbackDist = dist;
-                fallbackIndex = i;
-            }
-
-            if (!hasLineOfSightToPos(dodgePoints.get(i))) continue;
-
-            if (dist > bestLosDist) {
-                bestLosDist = dist;
-                bestLosIndex = i;
-            }
-        }
-
-        if (bestLosIndex != -1) {
-            return bestLosIndex;
-        }
-
-        LOGGER.info("[Greg] No LOS dodge point found, falling back to furthest");
-        return fallbackIndex;
+    public void setThreatDodgeCooldown(int ticks) {
+        this.threatDodgeCooldown = ticks;
     }
 
     /**
-     * Returns true if Greg has an unobstructed block-collision line of sight to the centre of target.
-     * Uses the same COLLIDER shape check that vanilla mob AI uses for visibility.
-     */
-    private boolean hasLineOfSightToPos(BlockPos target) {
-        Vec3 eyePos = this.getEyePosition();
-        Vec3 targetCenter = Vec3.atCenterOf(target);
-        ClipContext ctx = new ClipContext(eyePos, targetCenter, ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, this);
-        BlockHitResult hit = this.level().clip(ctx);
-        return hit.getType() == HitResult.Type.MISS;
-    }
-
-    /**
-     * Spawns an arrow aimed at the given BlockPos and adds it to the level.
-     * Uses ProjectileUtil.getMobArrow so the arrow is created the same way a skeleton would fire it.
-     * Sets high velocity and no gravity so it travels directly toward the dodge point.
-     */
-    private AbstractArrow fireDodgeArrow(ServerLevel serverLevel, BlockPos target) {
-        AbstractArrow arrow = ProjectileUtil.getMobArrow(this, new ItemStack(Items.ARROW), 1.0F, null);
-        arrow.setPos(this.getX(), this.getEyeY(), this.getZ());
-
-        // Aim toward the centre of the target block
-        double dx = target.getX() + 0.5 - this.getX();
-        double dy = target.getY() + 0.5 - this.getEyeY();
-        double dz = target.getZ() + 0.5 - this.getZ();
-        Vec3 direction = new Vec3(dx, dy, dz).normalize();
-        arrow.setDeltaMovement(direction.scale(3.0));
-        arrow.setNoGravity(true);
-
-        serverLevel.addFreshEntity(arrow);
-        return arrow;
-    }
-
-    /**
-     * Runs the ranged attack timer each server tick.
-     * Fires unconditionally once the countdown reaches zero — no line of sight required.
+     * Runs the ranged attack timer each server tick. Fires once the countdown reaches zero, but only
+     * while Greg can see the target — that line-of-sight gate is what silences him during a hide for
+     * free, and what tickLosRecovery exists to notice when it isn't deliberate.
      */
     private void tickRangedAttack() {
         if (dodgeShootLockout > 0) {
@@ -478,14 +806,44 @@ public class GregEntity extends Chicken implements RangedAttackMob{
 
         LivingEntity target = this.getTarget();
         if (target == null) {
-            // Reset state when Greg has no target
+            // Reset state when Greg has no target, so the next stall logs as a fresh transition
             attackTime = -1;
+            holdingFire = false;
+            outOfRange = false;
             return;
         }
 
-        if (!this.hasLineOfSight(target)){
+        // Range gate: past the boss's RangeLimit() its hurt() discards Greg's damage entirely, so firing
+        // is wasted (and spawns a homing missile that can never land damage). Reads the live per-boss
+        // limit, so it tracks the server's Cataclysm config; an uncapped target returns MAX_VALUE and
+        // never trips. Edge-triggered log, like holdingFire, to avoid per-tick spam.
+        double rangeLimitSq = effectiveRangeLimitSq(target);
+        if (this.distanceToSqr(target) > rangeLimitSq) {
+            if (!outOfRange) {
+                outOfRange = true;
+                LOGGER.info("[Greg] Holding fire — {} beyond damage range ({} > {} blocks)",
+                        target.getType().toShortString(),
+                        String.format("%.1f", Math.sqrt(this.distanceToSqr(target))),
+                        String.format("%.1f", Math.sqrt(rangeLimitSq)));
+            }
             return;
         }
+        outOfRange = false;
+
+        if (!this.hasLineOfSight(target)){
+            // Logged on the transition only — per-tick would be ~20 lines per stall and 124 during a
+            // DEATHLASER hide. Without it, "Greg is behind a rock" and "Greg has no target" look
+            // identical in the log: both are just an absence of Fired lines.
+            //
+            // This needs its own flag rather than reusing losLostTicks: that counter is reset every
+            // tick while hiding or in transit, so it would read as a fresh transition each time.
+            if (!holdingFire) {
+                holdingFire = true;
+                LOGGER.info("[Greg] Holding fire — no line of sight to {}", target.getType().toShortString());
+            }
+            return;
+        }
+        holdingFire = false;
 
         if (--attackTime == 0) {
             float distanceFactor = Mth.clamp(
@@ -499,388 +857,85 @@ public class GregEntity extends Chicken implements RangedAttackMob{
         }
     }
 
-    /** Dispatches the ranged attack based on the current combat state. */
+    /**
+     * The squared distance beyond which the target's hurt() discards Greg's damage, with the small
+     * slack tickRangedAttack has always used (+5 on the squared distance, ~0.2 blocks at Scylla's 12).
+     *
+     * <p><b>Shared by tickRangedAttack (the fire gate) and tickRegainDistance (the recovery
+     * trigger), and the two MUST read the same expression</b>: a stricter recovery threshold would
+     * dodge Greg when he can already shoot, a looser one leaves a dead band where he neither fires
+     * nor recovers. See plans/distance_recover_plan.md issue 3.
+     */
+    private double effectiveRangeLimitSq(LivingEntity target) {
+        return DodgeHandler.damageRangeLimitSq(target) + 5;
+    }
+
+    /**
+     * Fires Greg's ranged attack at the target. The attack itself lives in AttackHandler.
+     *
+     * <p>{@code distanceFactor} is accepted to satisfy RangedAttackMob and is deliberately unused —
+     * neither attack scales with range.
+     */
     @Override
     public void performRangedAttack(LivingEntity target, float distanceFactor) {
         if (!this.hasLineOfSight(target)){
             return;
         }
 
-        fireSonicBoomAt(target);
+        //AttackHandler.fireWitherHomingMissileAt(this, target);
+        AttackHandler.fireSonicBoomAt(this, target);
     }
 
     /**
-     * Fires a sonic boom from Greg's eye position toward the centre of the target's bounding box.
-     * Mirrors the Warden's SonicBoom behavior: sends SONIC_BOOM particles along the ray,
-     */
-    private void fireSonicBoomAt(Entity target) {
-
-        double eyeX = this.getX();
-        double eyeY = this.getEyeY();
-        double eyeZ = this.getZ();
-
-        // Aim at the centre of the target's bounding box
-        double aimY = target.getBoundingBox().getCenter().y;
-        Vec3 direction = new Vec3(target.getX() - eyeX, aimY - eyeY, target.getZ() - eyeZ).normalize();
-
-        // Origin is 3 blocks ahead of Greg in the direction of the target
-        Vec3 origin = new Vec3(eyeX, eyeY, eyeZ).add(direction.scale(3.0));
-
-        // Send particles along the ray from the origin to the target
-        ServerLevel serverLevel = (ServerLevel) this.level();
-        int rayLength = Mth.floor(this.distanceTo(target)) + 7;
-        for (int i = 1; i < rayLength; i++) {
-            Vec3 particlePos = origin.add(direction.scale(i));
-            serverLevel.sendParticles(ParticleTypes.SONIC_BOOM, particlePos.x, particlePos.y, particlePos.z, 1, 0.0, 0.0, 0.0, 0.0);
-        }
-
-        this.playSound(SoundEvents.WARDEN_SONIC_BOOM, 1.0F, 1.0F);
-
-        // Deal damage and apply knockback matching the Warden's sonic boom
-        if (target.hurt(this.level().damageSources().sonicBoom(this), 10.0F)) {
-            if (target instanceof LivingEntity living) {
-                double knockH = 2.5 * (1.0 - living.getAttributeValue(Attributes.KNOCKBACK_RESISTANCE));
-                double knockV = 0.5 * (1.0 - living.getAttributeValue(Attributes.KNOCKBACK_RESISTANCE));
-                living.push(direction.x * knockH, direction.y * knockV, direction.z * knockH);
-            }
-        }
-
-        LOGGER.info("[Greg] Fired SonicBoom at entity={} pos={}", target.getType().toShortString(), this.blockPosition());
-    }
-
-    /**
-     * Fires a WitherSkull from 1 block ahead of Greg toward the given entity.
-     * Aims at the centre of the entity's bounding box. Skips if the entity is within 3 blocks.
-     */
-    private void fireWitherSkullAt(Entity target) {
-        if (this.distanceTo(target) <= 3.0F) {
-            LOGGER.info("[Greg] Target too close to shoot (distance={}), skipping", this.distanceTo(target));
-            return;
-        }
-
-        double eyeX = this.getX();
-        double eyeY = this.getEyeY();
-        double eyeZ = this.getZ();
-
-        // Aim at the centre of the target's bounding box
-        double aimY = target.getBoundingBox().getCenter().y;
-        double dx = target.getX() - eyeX;
-        double dy = aimY - eyeY;
-        double dz = target.getZ() - eyeZ;
-        Vec3 direction = new Vec3(dx, dy, dz).normalize();
-
-        // Spawn 1 block ahead of Greg in the direction of the target
-        WitherSkull skull = new WitherSkull(this.level(), this, direction);
-
-        skull.setOwner(this);
-        skull.setPosRaw(eyeX + direction.x, eyeY + direction.y, eyeZ + direction.z);
-        this.level().addFreshEntity(skull);
-
-        if (!this.isSilent()) {
-            this.level().levelEvent(null, 1024, this.blockPosition(), 0);
-        }
-
-        LOGGER.info("[Greg] Fired WitherSkull at entity={} pos={}", target.getType().toShortString(), this.blockPosition());
-    }
-
-    /**
-     * Fires a Wither_Homing_Missile_Entity from Greg's eye position toward the given entity.
-     * Mirrors the Harbinger's mlaunch: constructs with (shooter, direction, level, damage, target),
-     * spawns 1 block ahead in the direction of the target.
-     */
-    private void fireWitherHomingMissileAt(LivingEntity target) {
-        double eyeX = this.getX();
-        double eyeY = this.getEyeY();
-        double eyeZ = this.getZ();
-
-        // Aim at the centre of the target's bounding box
-        double aimY = target.getBoundingBox().getCenter().y;
-        Vec3 direction = new Vec3(target.getX() - eyeX, aimY - eyeY, target.getZ() - eyeZ).normalize();
-
-        Wither_Homing_Missile_Entity missile = new Wither_Homing_Missile_Entity(this, direction, this.level(), 10.0F, target);
-        // Spawn 2 blocks ahead of Greg in the direction of the target
-        missile.setPosRaw(eyeX + direction.x * 3, eyeY + direction.y * 3, eyeZ + direction.z * 3);
-        this.level().addFreshEntity(missile);
-
-        LOGGER.info("[Greg] Fired Wither Homing Missile at entity={} pos={}", target.getType().toShortString(), this.blockPosition());
-    }
-
-    /**
-     * Fires an Abyss_Orb_Entity from 2 blocks ahead of Greg toward the given entity.
-     * The orb homes in on the target; damage mirrors the default config value of 4.
-     */
-    private void fireAbyssOrbAt(LivingEntity target) {
-        double eyeX = this.getX();
-        double eyeY = this.getEyeY();
-        double eyeZ = this.getZ();
-
-        // Aim at the centre of the target's bounding box
-        double aimY = target.getBoundingBox().getCenter().y;
-        Vec3 direction = new Vec3(target.getX() - eyeX, aimY - eyeY, target.getZ() - eyeZ).normalize();
-
-        // Spawn 2 blocks ahead of Greg in the direction of the target
-        double spawnX = eyeX + direction.x * 2;
-        double spawnY = eyeY + direction.y * 2;
-        double spawnZ = eyeZ + direction.z * 2;
-
-        Abyss_Orb_Entity orb = new Abyss_Orb_Entity(this, spawnX, spawnY, spawnZ, this.level(), 4.0F, target);
-        this.level().addFreshEntity(orb);
-
-        LOGGER.info("[Greg] Fired Abyss Orb at entity={} pos={}", target.getType().toShortString(), this.blockPosition());
-    }
-
-    /**
-     * Fires a Flare_Bomb_Entity from Greg's eye position toward the given entity.
-     * Aims at the lower third of the target's bounding box with a slight upward arc
-     * (+ 0.2 * horizontal distance) matching the Netherite Monstrosity's own shoot logic.
-     * Skips if the target is within 3 blocks.
-     */
-    private void fireFlareBombAt(Entity target) {
-        if (this.distanceTo(target) <= 3.0F) {
-            LOGGER.info("[Greg] Target too close to shoot flare bomb (distance={}), skipping", this.distanceTo(target));
-            return;
-        }
-
-        double eyeX = this.getX();
-        double eyeY = this.getEyeY();
-        double eyeZ = this.getZ();
-
-        // Aim at the lower third of the target's bounding box
-        double aimY = target.getBoundingBox().minY + target.getBbHeight() / 3.0;
-        double dx = target.getX() - eyeX;
-        double dy = aimY - eyeY;
-        double dz = target.getZ() - eyeZ;
-        // Arc factor mirrors the Monstrosity: adds +0.2 blocks of lift per block of horizontal distance
-        double horizontalDist = Math.sqrt(dx * dx + dz * dz);
-
-        Flare_Bomb_Entity flare = new Flare_Bomb_Entity(
-                ModEntities.FLARE_BOMB.get(),
-                this.level(),
-                this
-        );
-        flare.setPosRaw(eyeX, eyeY, eyeZ);
-        flare.shoot(dx, dy + 0.2 * horizontalDist, dz, 1.0F, 1.0F);
-        this.level().addFreshEntity(flare);
-
-        LOGGER.info("[Greg] Fired FlareBomb at entity={} pos={}", target.getType().toShortString(), this.blockPosition());
-    }
-
-    /**
-     * Fires a Lava_Bomb_Entity from Greg's eye position toward the given entity.
-     * On hit, the bomb creates a power-2 explosion (no block destruction).
-     * Uses the same arc and aim logic as fireFlareBombAt.
-     * Skips if the target is within 3 blocks.
-     */
-    private void fireLavaBombAt(Entity target) {
-        if (this.distanceTo(target) <= 3.0F) {
-            LOGGER.info("[Greg] Target too close to shoot lava bomb (distance={}), skipping", this.distanceTo(target));
-            return;
-        }
-
-        double eyeX = this.getX();
-        double eyeY = this.getEyeY();
-        double eyeZ = this.getZ();
-
-        double aimY = target.getBoundingBox().minY + target.getBbHeight() / 3.0;
-        double dx = target.getX() - eyeX;
-        double dy = aimY - eyeY;
-        double dz = target.getZ() - eyeZ;
-        double horizontalDist = Math.sqrt(dx * dx + dz * dz);
-
-        Lava_Bomb_Entity lava = new Lava_Bomb_Entity(
-                ModEntities.LAVA_BOMB.get(),
-                this.level(),
-                this
-        );
-        lava.setPosRaw(eyeX, eyeY, eyeZ);
-        lava.shoot(dx, dy + 0.2 * horizontalDist, dz, 1.0F, 1.0F);
-        this.level().addFreshEntity(lava);
-
-        LOGGER.info("[Greg] Fired LavaBomb at entity={} pos={}", target.getType().toShortString(), this.blockPosition());
-    }
-
-    /**
-     * Builds a hollow 5×5 obsidian box centred on the target's block position,
-     * 5 blocks tall, with no floor (boss stands on existing ground) and no ceiling.
-     * Only air blocks are replaced; existing blocks are never overwritten.
-     * Placed positions are recorded in {@code activeWallBlocks} and torn down after 80 ticks
-     * by the shared {@code tickWall} mechanism.
-     */
-    public void buildWallBox(Entity target, int radius, int timer) {
-        ServerLevel serverLevel = (ServerLevel) this.level();
-
-        int centerX = target.getBlockX();
-        int baseY   = Mth.floor(target.getY());
-        int centerZ = target.getBlockZ();
-
-        BlockState wallBlock = Blocks.BEDROCK.defaultBlockState();
-        int placed = 0;
-
-        // place on the XZ perimeter (sides) and the top/bottom caps
-        for (int wx = -radius; wx <= radius; wx++) {
-            for (int wz = -radius; wz <= radius; wz++) {
-                for (int h = -radius; h <= radius; h++) {
-                    boolean onXZPerimeter = wx == -radius || wx == radius || wz == -radius || wz == radius;
-                    boolean onYCap = h == -radius || h == radius;
-                    if (!onXZPerimeter && !onYCap) continue; // skip interior
-                    BlockPos pos = new BlockPos(centerX + wx, baseY + h, centerZ + wz);
-                    if (serverLevel.getBlockState(pos).isAir() || serverLevel.getBlockState(pos).is(Blocks.WATER)) {
-                        serverLevel.setBlock(pos, wallBlock, 3);
-                        activeWallBlocks.put(pos, timer);
-                        placed++;
-                    }
-                }
-            }
-        }
-
-        LOGGER.info("[Greg] Built box around {}: {} blocks placed, each expires in {} ticks",
-                target.blockPosition(), placed, timer);
-    }
-
-    /**
-     * Builds a 10-wide × 5-tall obsidian wall perpendicular to the Greg-to-target direction,
-     * placed with its base at Greg's feet and its centre 3 blocks in front of Greg.
-     * Only air blocks are replaced; existing blocks are never overwritten.
-     * All placed positions are recorded in {@code activeWallBlocks} and torn down after 40 ticks.
-     * Calling this while a wall is already active resets the timer and extends the existing wall.
-     */
-    public void buildWall(Entity target) {
-        ServerLevel serverLevel = (ServerLevel) this.level();
-
-        // Horizontal direction from Greg toward the target (Y ignored so the wall stays vertical)
-        double dx = target.getX() - this.getX();
-        double dz = target.getZ() - this.getZ();
-        Vec3 dir = new Vec3(dx, 0, dz).normalize();
-
-        // Wall centre: 3 blocks ahead of Greg in the direction of the target
-        double centerX = this.getX() + dir.x * 10;
-        double centerZ = this.getZ() + dir.z * 10;
-        int baseY = Mth.floor(this.getY());
-
-        // Perpendicular direction in the horizontal plane (rotate dir 90° around Y)
-        Vec3 perp = new Vec3(-dir.z, 0, dir.x);
-
-        BlockState wallBlock = Blocks.OBSIDIAN.defaultBlockState();
-        int placed = 0;
-
-        // 10 columns centred on the midpoint (-5 to +4), 5 rows from baseY upward
-        for (int w = -5; w < 5; w++) {
-            for (int h = -5; h < 5; h++) {
-                BlockPos pos = BlockPos.containing(
-                        centerX + perp.x * w,
-                        baseY + h,
-                        centerZ + perp.z * w
-                );
-                // Only place in air — never overwrite existing blocks
-                if (serverLevel.getBlockState(pos).isAir()) {
-                    serverLevel.setBlock(pos, wallBlock, 3);
-                    activeWallBlocks.put(pos, 80);
-                    placed++;
-                }
-            }
-        }
-
-        LOGGER.info("[Greg] Built wall: {} blocks placed, each expires in 80 ticks", placed);
-    }
-
-    /**
-     * Decrements each active wall block's individual timer every tick.
-     * Blocks whose timer reaches zero are removed from the world and the tracking map.
-     */
-    private void tickWall() {
-        if (activeWallBlocks.isEmpty()) return;
-
-        ServerLevel serverLevel = (ServerLevel) this.level();
-        int broken = 0;
-        Iterator<Map.Entry<BlockPos, Integer>> it = activeWallBlocks.entrySet().iterator();
-        while (it.hasNext()) {
-            Map.Entry<BlockPos, Integer> entry = it.next();
-            int remaining = entry.getValue() - 1;
-            if (remaining <= 0) {
-                BlockPos pos = entry.getKey();
-                if (serverLevel.getBlockState(pos).is(Blocks.OBSIDIAN) || serverLevel.getBlockState(pos).is(Blocks.BEDROCK)) {
-                    serverLevel.setBlock(pos, Blocks.AIR.defaultBlockState(), 3);
-                    broken++;
-                }
-                it.remove();
-            } else {
-                entry.setValue(remaining);
-            }
-        }
-        if (broken > 0) {
-            LOGGER.info("[Greg] tickWall: removed {} expired blocks", broken);
-        }
-    }
-
-    /**
-     * Fires a WindCharge from Greg's eye position toward the given entity.
-     * Uses the player WindCharge (not BreezeWindCharge, which is Breeze-specific).
-     * Spawned at eye level and aimed at the centre of the target's bounding box.
-     * The Breeze shoots at velocity 0.7F; we match that here.
-     * Skips if the target is within 3 blocks.
-     */
-    private void fireWindChargeAt(Entity target) {
-        if (this.distanceTo(target) <= 3.0F) {
-            LOGGER.info("[Greg] Target too close to shoot wind charge (distance={}), skipping", this.distanceTo(target));
-            return;
-        }
-
-        double eyeX = this.getX();
-        double eyeY = this.getEyeY();
-        double eyeZ = this.getZ();
-
-        Vec3 direction = new Vec3(
-                target.getX() - eyeX,
-                target.getBoundingBox().getCenter().y - eyeY,
-                target.getZ() - eyeZ
-        ).normalize();
-
-        // WindCharge(Level, x, y, z, direction) positions the charge and sets its trajectory
-        WindCharge charge = new WindCharge(this.level(), eyeX, eyeY, eyeZ, direction);
-        this.level().addFreshEntity(charge);
-
-        LOGGER.info("[Greg] Fired WindCharge at entity={} pos={}", target.getType().toShortString(), this.blockPosition());
-    }
-
-    /**
-     * Returns all tracked boss projectiles within 5 blocks of Greg.
-     * Netherite Monstrosity: Flare_Bomb_Entity, Lava_Bomb_Entity.
-     * Harbinger: Laser_Beam_Entity, Wither_Missile_Entity, Wither_Homing_Missile_Entity.
+     * Returns all tracked boss projectiles within 30 blocks of Greg that aren't blocked by geometry.
+     * Maledictus: Phantom_Halberd_Entity, Phantom_Arrow_Entity.
+     * Scylla: Spark_Entity, Scylla_Ceraunus_Entity (outbound only).
+     * Harbinger, Netherite Monstrosity, Leviathan and Ignis entries are present but commented out.
+     *
+     * <p><b>Only travelling, self-expiring threats belong here.</b> The list is consumed by
+     * tickThreatDetection, which dodges whenever it is non-empty, and the geometry filter below clips
+     * from Greg's eye to each threat's bounding-box <i>centre</i>. That shape assumes a moving point
+     * that goes away, and two kinds of entity break it:
+     * <ul>
+     *   <li><b>Persistent</b> ones keep the list non-empty for their whole lifetime, so Greg re-dodges
+     *       every time the cooldown expires. This is why the anchor is filtered to its outbound phase
+     *       and why Cm_Falling_Block_Entity is commented out
+     *   <li><b>Radius</b> ones (Scylla's Lightning_Area_Effect_Entity, up to 32 blocks) make the
+     *       centre clip the wrong question entirely: what matters is whether Greg is <i>inside</i>
+     *       them, and a cloud he is standing in can have its centre behind terrain and be discarded as
+     *       "blocked" while it burns him. Adding those needs a radius-aware branch first
+     * </ul>
+     *
+     * <p><b>There is no owner filter.</b> Harmless while every entry is boss-owned, but Greg now fires
+     * a Wither_Homing_Missile_Entity every tick and that type has a commented-out line below —
+     * uncommenting it as-is would make his own shots threats and dodge him in circles forever.
      */
     public List<Entity> getThreatList() {
         List<Entity> threats = new ArrayList<>();
-        var aabb = this.getBoundingBox().inflate(15);
+        var aabb = this.getBoundingBox().inflate(10);
 
-        // Netherite Monstrosity projectiles
-//        threats.addAll(this.level().getEntitiesOfClass(Flare_Bomb_Entity.class, aabb));
-//        threats.addAll(this.level().getEntitiesOfClass(Lava_Bomb_Entity.class, aabb));
+        // Scylla projectiles. Only the two that are genuinely travelling points — see
+        // plans/scylla_plan.md for why her other three damage entities are excluded.
+        threats.addAll(this.level().getEntitiesOfClass(Spark_Entity.class, aabb));
+        threats.addAll(this.level().getEntitiesOfClass(Lightning_Spear_Entity.class, aabb));
+        threats.addAll(this.level().getEntitiesOfClass(Water_Spear_Entity.class, aabb));
+        // The thrown anchor is deliberately NOT in this list. It is handled by the hide path instead:
+        // ModGameBusEvents raises pendingThreatHide on its spawn and tickThreatHide breaks line of sight
+        // so terrain eats it (the anchor flies straight outbound and onHitBlock bounces it back to
+        // Scylla without hitting Greg). Keeping it here too made tickThreatDetection dodge Greg *toward*
+        // the boss whenever a hide found no covered point, walking him into the anchor's impact hit
+        // (cataclysm.storm_bringer) — the double-handling that killed Greg on 2026-07-24. The dodge and
+        // the hide fight over the same threatDodgeCooldown, so the anchor gets exactly one responder.
 
-        // Harbinger projectiles
-//        threats.addAll(this.level().getEntitiesOfClass(Laser_Beam_Entity.class, aabb));
-//        threats.addAll(this.level().getEntitiesOfClass(Wither_Missile_Entity.class, aabb));
-//        threats.addAll(this.level().getEntitiesOfClass(Wither_Homing_Missile_Entity.class, aabb));
-        // Leviathan projectiles
-//        threats.addAll(this.level().getEntitiesOfClass(Abyss_Blast_Portal_Entity.class, aabb));
-//        threats.addAll(this.level().getEntitiesOfClass(Abyss_Mine_Entity.class, aabb));
-//        threats.addAll(this.level().getEntitiesOfClass(Abyss_Orb_Entity.class, aabb));
-//        threats.addAll(this.level().getEntitiesOfClass(The_Leviathan_Entity.class, aabb));
-//        threats.addAll(this.level().getEntitiesOfClass(Dimensional_Rift_Entity.class, aabb));
-
-        // Ignis projectiles
-        threats.addAll(this.level().getEntitiesOfClass(Ignis_Entity.class, aabb));
-        threats.addAll(this.level().getEntitiesOfClass(Ignis_Fireball_Entity.class, aabb));
-        threats.addAll(this.level().getEntitiesOfClass(Ignis_Abyss_Fireball_Entity.class, aabb));
-        threats.addAll(this.level().getEntitiesOfClass(Flame_Strike_Entity.class, aabb));
-
-//        threats.removeIf(threat -> {
-//            Vec3 targetCenter = threat.getBoundingBox().getCenter();
-//            ClipContext ctx = new ClipContext(this.getEyePosition(), targetCenter, ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, this);
-//            boolean blocked = this.level().clip(ctx).getType() != HitResult.Type.MISS;
-//            if (blocked) {
-//                LOGGER.info("[Greg] Threat blocked by geometry, ignoring: type={} pos={}", threat.getType().toShortString(), threat.blockPosition());
-//            }
-//            return blocked;
-//        });
+        threats.removeIf(threat -> {
+            Vec3 targetCenter = threat.getBoundingBox().getCenter();
+            ClipContext ctx = new ClipContext(this.getEyePosition(), targetCenter, ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, this);
+            boolean blocked = this.level().clip(ctx).getType() != HitResult.Type.MISS;
+            if (blocked) {
+                LOGGER.info("[Greg] Threat blocked by geometry, ignoring: type={} pos={}", threat.getType().toShortString(), threat.blockPosition());
+            }
+            return blocked;
+        });
 
         for (Entity threat : threats) {
             LOGGER.info("[Greg] Threat: type={} pos={}", threat.getType().toShortString(), threat.blockPosition());
@@ -899,13 +954,18 @@ public class GregEntity extends Chicken implements RangedAttackMob{
     }
 
     /**
-     * Tightens the leash pull threshold from the default 6 blocks down to 2,
-     * so Greg stays close to the dodge arrow at all times.
-     * Returning true tells tickLeash to skip its default 6/10 block distance checks.
+     * Adds an extra elastic pull toward the dodge arrow past 3 blocks, so Greg is dragged to it
+     * faster than vanilla alone would manage.
+     *
+     * <p>Note the return value: {@code false} is what makes {@code Leashable.tickLeash} bail early;
+     * returning true lets it run its normal 6/10-block ladder afterwards. That is deliberate — the
+     * ladder's elastic pull is what actually moves Greg most of the way. Between 3 and 10 blocks
+     * both pulls apply, which is the intended extra yank; past 10 blocks vanilla would drop the
+     * leash, but {@link #leashTooFarBehaviour} no-ops that, leaving only this pull.
      */
     @Override
     public boolean handleLeashAtDistance(Entity leashHolder, float distance) {
-        if (distance > 8.0F) {
+        if (distance > 1.0F) {
             this.elasticRangeLeashBehaviour(leashHolder, distance);
         }
         return true;
@@ -920,9 +980,34 @@ public class GregEntity extends Chicken implements RangedAttackMob{
     /**
      * Intercepts incoming damage to log the source, amount, whether it landed,
      * and Greg's remaining HP. Server-side only to avoid duplicate logs.
+     *
+     * <p>First refuses damage from any projectile Greg owns. He fires a homing missile every tick
+     * (ATTACK_INTERVAL = 1), so ~80 are alive at once; they turn to follow their target and can cross
+     * a spot he has been dragged to by a dodge leash, and each one explodes when its 80-tick fuse
+     * expires. Vanilla does not protect a shooter from its own projectile — Projectile.canHitEntity
+     * excludes only same-vehicle passengers, not the owner — so at 4 HP this would kill him quickly.
+     *
+     * <p>Both damage paths carry the missile as the damage source's <b>direct</b> entity: a direct hit
+     * builds {@code mobProjectile(missile, owner)}, and the fuse explosion passes a null DamageSource
+     * to Level.explode so Explosion builds {@code explosion(missile, owner)} itself. So one ownership
+     * test covers both.
+     *
+     * <p>Deliberately keyed on ownership rather than on the damage type: filtering explosions by type
+     * would also make Greg immune to Scylla's anchor_explosion and Maledictus's AoE, a large silent
+     * buff. Keyed on Projectile rather than Wither_Homing_Missile_Entity so it stays correct if Greg
+     * ever fires something else — and it covers the dodge arrow for free. Explosion <b>knockback</b>
+     * is applied separately from damage and is NOT suppressed by this.
      */
     @Override
     public boolean hurt(DamageSource source, float amount) {
+        if (source.getDirectEntity() instanceof Projectile projectile && projectile.getOwner() == this) {
+            if (!this.level().isClientSide()) {
+                LOGGER.info("[Greg] Ignored self-inflicted damage: type={} direct={} amount={}",
+                        source.type().msgId(), projectile.getType().toShortString(), amount);
+            }
+            return false;
+        }
+
         boolean result = super.hurt(source, amount);
         if (!this.level().isClientSide()) {
             LOGGER.info("[Greg] hurt by={} amount={} result={} hp={}/{}",
@@ -932,13 +1017,17 @@ public class GregEntity extends Chicken implements RangedAttackMob{
     }
 
     /**
-     * Logs Greg's death cause and position before delegating to vanilla death logic
-     * (loot drops, death animation trigger, stat tracking).
+     * Clears Greg's dodge trail and logs his death cause and position before delegating to vanilla
+     * death logic (loot drops, death animation trigger, stat tracking).
+     * Cleanup lives here rather than in remove() because remove() also fires on chunk unload and
+     * dimension change, which would delete the trail while Greg is still alive.
      */
     @Override
     public void die(DamageSource cause) {
         if (!this.level().isClientSide()) {
             LOGGER.info("[Greg] died cause={} pos={}", cause.type().msgId(), this.blockPosition());
+            ServerLevel serverLevel = (ServerLevel) this.level();
+            DodgeVisualizer.clearTrail(serverLevel, GregSavedData.get(serverLevel.getServer()));
         }
         super.die(cause);
     }

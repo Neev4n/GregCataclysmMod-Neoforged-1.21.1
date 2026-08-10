@@ -2,13 +2,12 @@ package net.neevan.gregcatmod.mixin;
 
 import com.github.L_Ender.cataclysm.entity.AnimationMonster.BossMonsters.LLibrary_Boss_Monster;
 import com.github.L_Ender.cataclysm.entity.AnimationMonster.BossMonsters.The_Harbinger_Entity;
-import com.github.L_Ender.cataclysm.entity.AnimationMonster.LLibrary_Monster;
 import com.github.L_Ender.lionfishapi.server.animation.Animation;
 import com.github.L_Ender.lionfishapi.server.animation.IAnimatedEntity;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.level.Level;
-import net.neevan.gregcatmod.data.GregSavedData;
+import net.neevan.gregcatmod.util.GregSavedData;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
@@ -34,19 +33,29 @@ public abstract class HarbingerMixin extends LLibrary_Boss_Monster {
 
     /**
      * Runs at the end of every server-side AI step (called each tick from LivingEntity.tick).
-     * Fires a boss alert the first tick the Harbinger's animation changes to a known attack.
+     * Fires a boss alert the first tick the Harbinger's animation changes to a known attack, and
+     * republishes the hide-alert flag from the current animation.
      */
     @Inject(method = "aiStep", at = @At("TAIL"))
     private void onAiStep(CallbackInfo ci) {
         if (this.level().isClientSide()) return;
 
+        GregSavedData data = GregSavedData.get(((ServerLevel) this.level()).getServer());
         Animation current = this.getAnimation();
+
+        // Edge-triggered: the alert fires once, on the tick the animation changes
         if (current != prevAnimation && current != IAnimatedEntity.NO_ANIMATION) {
             String attackName = getAttackName(current);
             if (attackName != null) {
-                GregSavedData.get(((ServerLevel) this.level()).getServer()).setPendingBossAlert(attackName);
+                data.setPendingBossAlert(attackName);
             }
         }
+
+        // Level-triggered: rewritten every tick from the animation itself, so it clears the tick the
+        // laser ends — including when the animation is cut short by a stun or phase change. A timer
+        // seeded off the alert above would be a second source of truth and could only ever drift.
+        data.setHideAlertActive(current == The_Harbinger_Entity.DEATHLASER_ANIMATION);
+
         prevAnimation = current;
     }
 

@@ -5,9 +5,10 @@
   "mixins": [
     "LLibraryBossMonsterMixin",
     "IABossMonsterMixin",
-    "NetheriteMonstrosityMixin",
-    "EnderGuardianMixin",
-    "AncientRemnantMixin"
+    "IABossAlertMixin",
+    "HarbingerMixin",
+    "BlockDisplayAccessor",
+    "AbstractArrowMixin"
   ],
   "client": [
 

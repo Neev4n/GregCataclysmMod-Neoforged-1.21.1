@@ -8,7 +8,7 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.Mob;
-import net.neevan.gregcatmod.data.GregSavedData;
+import net.neevan.gregcatmod.util.GregSavedData;
 import net.neevan.gregcatmod.entity.custom.GregEntity;
 import org.slf4j.Logger;
 

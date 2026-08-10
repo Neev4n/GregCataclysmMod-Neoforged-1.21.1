@@ -90,6 +90,10 @@ neoForge {
 
         // applies to all the run configs above
         configureEach {
+            // Heap allocated to the game JVM (not the Gradle daemon -- that is org.gradle.jvmargs)
+            jvmArgument '-Xmx8G'
+            jvmArgument '-Xms4G'
+
             // Recommended logging data for a userdev environment
             // The markers can be added/remove as needed separated by commas.
             // "SCAN": For mods scan.
@@ -134,8 +138,8 @@ dependencies {
     // This maps to ./libs/coolmod-${mc_version}-${coolmod_version}.jar
     // The group id is ignored when searching -- in this case, it is "blank"
     // implementation "blank:coolmod-${mc_version}:${coolmod_version}"
-    implementation "curse.maven:lendercataclysm-551586:7845980"
-    implementation "curse.maven:lionfish-api-1001614:6168249"
+    implementation "curse.maven:lendercataclysm-551586:8364209"
+    implementation "curse.maven:lionfish-api-1001614:8345326"
     // Example mod dependency using a file as dependency
     // implementation files("libs/coolmod-${mc_version}-${coolmod_version}.jar")
 
